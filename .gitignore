@@ -42,6 +42,11 @@ hermes_agent.egg-info/
 wandb/
 testlogs
 
+# Local analysis/runtime output
+codedb.snapshot
+daily_ai_signals_report.md
+state/
+
 # CLI config (may contain sensitive SSH paths)
 cli-config.yaml
 

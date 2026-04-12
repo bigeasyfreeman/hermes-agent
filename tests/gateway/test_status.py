@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 
 from gateway import status
 
@@ -105,6 +106,17 @@ class TestGatewayRuntimeStatus:
 
 
 class TestScopedLocks:
+    def test_process_start_time_falls_back_to_ps_on_macos_style_hosts(self, monkeypatch):
+        monkeypatch.setattr(status.Path, "read_text", lambda self: (_ for _ in ()).throw(FileNotFoundError()))
+
+        def fake_run(cmd, capture_output, text, timeout, check):  # noqa: ARG001
+            assert cmd[:3] == ["ps", "-p", "4242"]
+            return subprocess.CompletedProcess(cmd, 0, stdout="Fri Apr 11 08:00:00 2026\n", stderr="")
+
+        monkeypatch.setattr(status.subprocess, "run", fake_run)
+
+        assert status._get_process_start_time(4242) is not None
+
     def test_acquire_scoped_lock_rejects_live_other_process(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
         lock_path = tmp_path / "locks" / "telegram-bot-token-2bb80d537b1da3e3.lock"
@@ -117,6 +129,7 @@ class TestScopedLocks:
 
         monkeypatch.setattr(status.os, "kill", lambda pid, sig: None)
         monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 123)
+        monkeypatch.setattr(status, "_read_process_cmdline", lambda pid: "python -m hermes_cli.main gateway")
 
         acquired, existing = status.acquire_scoped_lock("telegram-bot-token", "secret", metadata={"platform": "telegram"})
 
@@ -144,6 +157,31 @@ class TestScopedLocks:
         payload = json.loads(lock_path.read_text())
         assert payload["pid"] == os.getpid()
         assert payload["metadata"]["platform"] == "telegram"
+
+    def test_acquire_scoped_lock_replaces_live_non_gateway_pid_when_cmdline_disagrees(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        lock_path = tmp_path / "locks" / "telegram-bot-token-2bb80d537b1da3e3.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(json.dumps({
+            "pid": 99999,
+            "start_time": None,
+            "kind": "hermes-gateway",
+            "argv": ["python", "-m", "hermes_cli.main", "gateway"],
+        }))
+
+        monkeypatch.setattr(status.os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: None)
+        monkeypatch.setattr(status, "_read_process_cmdline", lambda pid: "python unrelated_worker.py")
+
+        acquired, _existing = status.acquire_scoped_lock(
+            "telegram-bot-token",
+            "secret",
+            metadata={"platform": "telegram"},
+        )
+
+        assert acquired is True
+        payload = json.loads(lock_path.read_text())
+        assert payload["pid"] == os.getpid()
 
     def test_release_scoped_lock_only_removes_current_owner(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))

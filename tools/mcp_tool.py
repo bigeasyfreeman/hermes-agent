@@ -842,10 +842,12 @@ class MCPServerTask:
                 f"MCP server '{self.name}': {malware_error}"
             )
 
+        server_cwd = config.get("cwd")
         server_params = StdioServerParameters(
             command=command,
             args=args,
             env=safe_env if safe_env else None,
+            cwd=server_cwd,
         )
 
         sampling_kwargs = self._sampling.session_kwargs() if self._sampling else {}

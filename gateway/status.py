@@ -14,6 +14,7 @@ concurrently under distinct configurations).
 import hashlib
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,7 +65,23 @@ def _get_process_start_time(pid: int) -> Optional[int]:
         # Field 22 in /proc/<pid>/stat is process start time (clock ticks).
         return int(stat_path.read_text().split()[21])
     except (FileNotFoundError, IndexError, PermissionError, ValueError, OSError):
+        pass
+
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
         return None
+
+    start_text = (result.stdout or "").strip()
+    if not start_text:
+        return None
+    return int(hashlib.sha256(start_text.encode("utf-8")).hexdigest()[:16], 16)
 
 
 def _read_process_cmdline(pid: int) -> Optional[str]:
@@ -73,11 +90,24 @@ def _read_process_cmdline(pid: int) -> Optional[str]:
     try:
         raw = cmdline_path.read_bytes()
     except (FileNotFoundError, PermissionError, OSError):
+        raw = b""
+
+    if raw:
+        return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
         return None
 
-    if not raw:
-        return None
-    return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+    command = (result.stdout or "").strip()
+    return command or None
 
 
 def _looks_like_gateway_process(pid: int) -> bool:
@@ -290,6 +320,8 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
                                     break
                     except (OSError, PermissionError):
                         pass
+                if not stale and not _looks_like_gateway_process(existing_pid):
+                    stale = True
         if stale:
             try:
                 lock_path.unlink(missing_ok=True)
