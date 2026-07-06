@@ -12,6 +12,15 @@ except ModuleNotFoundError:  # pytest imports this file as scripts.<module>.
     from scripts.torben_job_contract import isoformat, run_job, torben_home
 
 DEFAULT_AGENT_ROOT = Path("/Users/ericfreeman/.hermes/hermes-agent")
+# Interval jobs schedule their next run from completion, so short-interval
+# jobs (e.g. the 1-minute Gmail pull) routinely drift past a naive
+# minutes*drift_factor limit on transient jitter. A drift is only a HARD
+# failure when the gap clears an absolute floor AND the same job was already
+# drifting on the prior run (two consecutive misses). A single transient
+# drift is a warning, not a wake. The global scheduler-stall check below is
+# unaffected and still hard-fails immediately.
+MIN_DRIFT_HARD_FAIL_FLOOR_SECONDS = 300.0
+DRIFT_STATE_FILENAME = "torben-scheduler-guard-drift-state.json"
 PATCH_MARKERS = {
     "cron/jobs.py": [
         "Skipping cron job during due-check normalization",
@@ -120,11 +129,52 @@ def validate_registry(registry_path: Path) -> dict[str, Any]:
     }
 
 
-def inspect_liveness(registry_path: Path, *, now: datetime | None = None, drift_factor: float = 1.8) -> dict[str, Any]:
+def _load_prior_drift_names(state_path: Path | None) -> set[str]:
+    if state_path is None or not state_path.exists():
+        return set()
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    names = payload.get("drifting_job_names") if isinstance(payload, dict) else None
+    return {str(n) for n in names} if isinstance(names, list) else set()
+
+
+def _write_drift_state(state_path: Path | None, *, drifting_names: list[str], checked_at: str) -> None:
+    if state_path is None:
+        return
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(
+            json.dumps(
+                {"schema": "torben.scheduler-guard-drift.v1", "checked_at": checked_at, "drifting_job_names": sorted(drifting_names)},
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def inspect_liveness(
+    registry_path: Path,
+    *,
+    now: datetime | None = None,
+    drift_factor: float = 1.8,
+    state_path: Path | None = None,
+    persist_state: bool = True,
+) -> dict[str, Any]:
     current = (now or _utc_now()).astimezone(timezone.utc)
     payload = _read_json(registry_path)
     jobs = payload.get("jobs") if isinstance(payload.get("jobs"), list) else []
+    if state_path is None:
+        state_path = registry_path.parent.parent / "state" / DRIFT_STATE_FILENAME
+    prior_drift_names = _load_prior_drift_names(state_path)
+
     interval_drifts: list[dict[str, Any]] = []
+    interval_drift_warnings: list[dict[str, Any]] = []
+    drifting_now: list[str] = []
     last_dispatches: list[datetime] = []
     shortest_interval_minutes: int | None = None
     for job in jobs:
@@ -149,21 +199,32 @@ def inspect_liveness(registry_path: Path, *, now: datetime | None = None, drift_
         if not last_run:
             continue
         gap_seconds = (current - last_run).total_seconds()
-        drift_limit_seconds = minutes * 60 * drift_factor
-        if gap_seconds > drift_limit_seconds:
-            interval_drifts.append(
-                {
-                    "name": name,
-                    "minutes": minutes,
-                    "gap_seconds": round(gap_seconds, 3),
-                    "drift_limit_seconds": round(drift_limit_seconds, 3),
-                    "last_run_at": isoformat(last_run),
-                }
-            )
+        # A drift must clear BOTH the relative limit and an absolute floor so
+        # short-interval jitter alone never trips it.
+        drift_limit_seconds = max(minutes * 60 * drift_factor, MIN_DRIFT_HARD_FAIL_FLOOR_SECONDS)
+        if gap_seconds <= drift_limit_seconds:
+            continue
+        drifting_now.append(name)
+        record = {
+            "name": name,
+            "minutes": minutes,
+            "gap_seconds": round(gap_seconds, 3),
+            "drift_limit_seconds": round(drift_limit_seconds, 3),
+            "last_run_at": isoformat(last_run),
+            "consecutive": name in prior_drift_names,
+        }
+        # Hard-fail only on the second consecutive miss; first drift warns.
+        if name in prior_drift_names:
+            interval_drifts.append(record)
+        else:
+            interval_drift_warnings.append(record)
 
     errors: list[str] = []
     if interval_drifts:
-        errors.append("interval drift detected")
+        errors.append(
+            "interval drift detected (persistent, 2+ consecutive): "
+            + ", ".join(sorted(d["name"] for d in interval_drifts))
+        )
     if shortest_interval_minutes and last_dispatches:
         latest = max(last_dispatches)
         stall_limit_seconds = (shortest_interval_minutes + 2) * 60
@@ -173,10 +234,16 @@ def inspect_liveness(registry_path: Path, *, now: datetime | None = None, drift_
                 f"no non-desk job dispatched for {round(latest_gap, 3)}s "
                 f"(limit {round(stall_limit_seconds, 3)}s)"
             )
+
+    if persist_state:
+        _write_drift_state(state_path, drifting_names=drifting_now, checked_at=isoformat(current))
+
     return {
         "status": "pass" if not errors else "failed",
         "checked_at": isoformat(current),
         "interval_drifts": interval_drifts,
+        "interval_drift_warnings": interval_drift_warnings,
+        "min_drift_hard_fail_floor_seconds": MIN_DRIFT_HARD_FAIL_FLOOR_SECONDS,
         "errors": errors,
     }
 
