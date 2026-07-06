@@ -6,13 +6,13 @@ import base64
 import email.utils
 import json
 import os
-import subprocess
+import random
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +34,14 @@ DEFAULT_PROJECT_ID = "sigma-zodiac-485821-f0"
 DEFAULT_TOPIC_NAME = f"projects/{DEFAULT_PROJECT_ID}/topics/torben-gmail-watch"
 DEFAULT_SUBSCRIPTION_NAME = f"projects/{DEFAULT_PROJECT_ID}/subscriptions/torben-gmail-watch-pull"
 DEFAULT_LABEL_IDS = ("INBOX",)
+PUBSUB_SCOPE = "https://www.googleapis.com/auth/pubsub"
+PUBSUB_API_ROOT = "https://pubsub.googleapis.com/v1"
+DEFAULT_SERVICE_ACCOUNT_TOKEN_URI = "https://oauth2.googleapis.com/token"
+DEFAULT_HISTORY_RATE_LIMIT_RETRIES = 3
+DEFAULT_HISTORY_RATE_LIMIT_BACKOFF_SECONDS = 1.0
+DEFAULT_HISTORY_RATE_LIMIT_MAX_SLEEP_SECONDS = 30.0
+DEFAULT_HISTORY_RATE_LIMIT_JITTER_SECONDS = 0.5
+DEFAULT_HISTORY_RATE_LIMIT_COOLDOWN_SECONDS = 900
 
 REALTIME_CATEGORIES = {
     "calendar_scheduling",
@@ -120,6 +128,306 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
+
+
+class GmailHistoryRateLimitError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        account_alias: str,
+        account_email: str,
+        start_history_id: str,
+        attempts: int,
+        retry_count: int,
+        read_calls: int,
+    ) -> None:
+        super().__init__(f"{account_alias}: Gmail history rate limited after {attempts} read attempt(s)")
+        self.account_alias = account_alias
+        self.account_email = account_email
+        self.start_history_id = start_history_id
+        self.attempts = attempts
+        self.retry_count = retry_count
+        self.read_calls = read_calls
+
+
+def _retry_after_seconds(exc: urllib.error.HTTPError) -> float | None:
+    retry_after = exc.headers.get("Retry-After") if exc.headers else None
+    if not retry_after:
+        return None
+    value = str(retry_after).strip()
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        parsed = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError, AttributeError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(0.0, (parsed.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds())
+
+
+def _rate_limit_sleep_seconds(
+    *,
+    retry_index: int,
+    retry_after_seconds: float | None,
+    base_seconds: float,
+    max_seconds: float,
+    jitter_seconds: float,
+    jitter: Any,
+) -> float:
+    delay = retry_after_seconds if retry_after_seconds is not None else base_seconds * (2**retry_index)
+    if jitter_seconds > 0:
+        delay += float(jitter()) * jitter_seconds
+    return min(max(0.0, max_seconds), max(0.0, delay))
+
+
+def _rate_limit_warning(exc: GmailHistoryRateLimitError, *, notification_left_unacked: bool) -> str:
+    action = "cursor preserved and notification left unacked" if notification_left_unacked else "cursor preserved"
+    return f"{exc.account_alias}: Gmail history rate limited after {exc.attempts} read attempt(s); {action}"
+
+
+def _gmail_history_rate_limit_degradation(
+    *,
+    exc: GmailHistoryRateLimitError,
+    history_fallback: bool,
+    notification: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "status": "degraded",
+        "component": "gmail_history",
+        "provider": "gmail",
+        "reason": "rate_limited",
+        "message": "Gmail History API returned HTTP 429; realtime Gmail intake is degraded and cursor state was preserved.",
+        "account": {"alias": exc.account_alias, "email": exc.account_email},
+        "start_history_id": exc.start_history_id,
+        "attempts": exc.attempts,
+        "retry_count": exc.retry_count,
+        "gmail_read_api_calls": exc.read_calls,
+        "cursor_preserved": True,
+        "notification_left_unacked": not history_fallback,
+        "notification": notification or {},
+        "history_fallback": history_fallback,
+    }
+
+
+def _gmail_history_rate_limit_cooldown_degradation(
+    *,
+    account: GoogleAccount,
+    start_history_id: str,
+    cooldown_until: datetime,
+    notification: dict[str, Any] | None = None,
+    history_fallback: bool = False,
+) -> dict[str, Any]:
+    return {
+        "status": "degraded",
+        "component": "gmail_history",
+        "provider": "gmail",
+        "reason": "rate_limit_cooldown",
+        "message": "Gmail History API retry is deferred by cooldown after a recent HTTP 429.",
+        "account": {"alias": account.alias, "email": account.email},
+        "start_history_id": start_history_id,
+        "cooldown_until": cooldown_until.isoformat().replace("+00:00", "Z"),
+        "gmail_read_api_calls": 0,
+        "cursor_preserved": True,
+        "notification_left_unacked": not history_fallback,
+        "notification": notification or {},
+        "history_fallback": history_fallback,
+    }
+
+
+def _rate_limit_cooldown_until(
+    *,
+    alias_state: dict[str, Any],
+    state: dict[str, Any],
+    account_alias: str,
+    now: datetime,
+    cooldown_seconds: int,
+) -> datetime | None:
+    if cooldown_seconds <= 0:
+        return None
+    explicit_until = _parse_utc(alias_state.get("history_rate_limit_cooldown_until"))
+    if explicit_until and explicit_until > now:
+        return explicit_until
+
+    health = state.get("last_pubsub_pipeline_health") or {}
+    generated_at = _parse_utc(health.get("generated_at"))
+    if not generated_at:
+        return None
+    for item in health.get("degradations") or []:
+        if not isinstance(item, dict) or item.get("reason") != "rate_limited":
+            continue
+        account = item.get("account") or {}
+        if str(account.get("alias") or "") != account_alias:
+            continue
+        cooldown_until = generated_at + timedelta(seconds=cooldown_seconds)
+        return cooldown_until if cooldown_until > now else None
+    return None
+
+
+def _record_rate_limit_cooldown(
+    *,
+    alias_state: dict[str, Any],
+    exc: GmailHistoryRateLimitError,
+    notification: dict[str, Any] | None,
+    now: datetime,
+    cooldown_seconds: int,
+) -> None:
+    cooldown_until = now + timedelta(seconds=max(0, cooldown_seconds))
+    alias_state["history_rate_limit_last_failure_at"] = utc_now()
+    alias_state["history_rate_limit_cooldown_until"] = cooldown_until.isoformat().replace("+00:00", "Z")
+    alias_state["history_rate_limit_start_history_id"] = exc.start_history_id
+    alias_state["history_rate_limit_attempts"] = exc.attempts
+    if notification:
+        alias_state["history_rate_limit_notification_history_id"] = notification.get("history_id")
+        alias_state["history_rate_limit_notification_message_id"] = notification.get("message_id")
+
+
+def _clear_rate_limit_cooldown(alias_state: dict[str, Any]) -> None:
+    for key in (
+        "history_rate_limit_last_failure_at",
+        "history_rate_limit_cooldown_until",
+        "history_rate_limit_start_history_id",
+        "history_rate_limit_attempts",
+        "history_rate_limit_notification_history_id",
+        "history_rate_limit_notification_message_id",
+    ):
+        alias_state.pop(key, None)
+
+
+def _pipeline_health(
+    degradations: list[dict[str, Any]],
+    *,
+    pubsub_messages_received: int,
+    pubsub_messages_acked: int,
+    history_fallback: bool,
+) -> dict[str, Any]:
+    return {
+        "status": "degraded" if degradations else "pass",
+        "generated_at": utc_now(),
+        "component": "gmail_realtime",
+        "degradations": degradations,
+        "pubsub_messages_received": pubsub_messages_received,
+        "pubsub_messages_acked": pubsub_messages_acked,
+        "history_fallback": history_fallback,
+    }
+
+
+_PUBSUB_TOKEN_CACHE: dict[str, Any] | None = None
+
+
+def _load_json_object(path: Path, source: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{source} service account file is not valid JSON: {path}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{source} service account file must decode to a JSON object: {path}")
+    return payload
+
+
+def _load_service_account_info() -> dict[str, Any]:
+    """Load Pub/Sub service-account credentials from env without using gcloud."""
+    raw_json = os.getenv("TORBEN_GCP_SERVICE_ACCOUNT_JSON", "").strip()
+    if raw_json:
+        if raw_json.startswith("{"):
+            try:
+                payload = json.loads(raw_json)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("TORBEN_GCP_SERVICE_ACCOUNT_JSON is not valid JSON") from exc
+            if isinstance(payload, dict):
+                return payload
+            raise RuntimeError("TORBEN_GCP_SERVICE_ACCOUNT_JSON must decode to a JSON object")
+        candidate = Path(raw_json).expanduser()
+        if not candidate.exists():
+            raise RuntimeError(f"TORBEN_GCP_SERVICE_ACCOUNT_JSON points to a missing service account file: {candidate}")
+        return _load_json_object(candidate, "TORBEN_GCP_SERVICE_ACCOUNT_JSON")
+
+    for env_name in ("TORBEN_GCP_SERVICE_ACCOUNT_FILE", "GOOGLE_APPLICATION_CREDENTIALS"):
+        value = os.getenv(env_name, "").strip()
+        if not value:
+            continue
+        path = Path(value).expanduser()
+        if not path.exists():
+            raise RuntimeError(f"{env_name} points to a missing service account file: {path}")
+        return _load_json_object(path, env_name)
+
+    raise RuntimeError(
+        "Gmail Pub/Sub realtime requires service-account credentials. Set "
+        "TORBEN_GCP_SERVICE_ACCOUNT_JSON, TORBEN_GCP_SERVICE_ACCOUNT_FILE, or "
+        "GOOGLE_APPLICATION_CREDENTIALS to a key with Pub/Sub subscriber access."
+    )
+
+
+def _service_account_access_token() -> str:
+    global _PUBSUB_TOKEN_CACHE
+    now = int(time.time())
+    if _PUBSUB_TOKEN_CACHE and int(_PUBSUB_TOKEN_CACHE.get("expires_at", 0)) - 60 > now:
+        return str(_PUBSUB_TOKEN_CACHE["access_token"])
+
+    info = _load_service_account_info()
+    client_email = str(info.get("client_email") or "")
+    private_key = str(info.get("private_key") or "")
+    token_uri = str(info.get("token_uri") or DEFAULT_SERVICE_ACCOUNT_TOKEN_URI)
+    if not client_email or not private_key:
+        raise RuntimeError("Service account credentials must include client_email and private_key")
+
+    try:
+        import jwt
+    except Exception as exc:  # pragma: no cover - dependency missing path
+        raise RuntimeError("PyJWT with crypto support is required to sign service-account Pub/Sub tokens") from exc
+
+    issued_at = now
+    claims = {
+        "iss": client_email,
+        "scope": PUBSUB_SCOPE,
+        "aud": token_uri,
+        "iat": issued_at,
+        "exp": issued_at + 3600,
+    }
+    assertion = jwt.encode(claims, private_key, algorithm="RS256", headers={"typ": "JWT"})
+    body = urllib.parse.urlencode(
+        {
+            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "assertion": assertion,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        token_uri,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        payload = json.loads(response.read().decode("utf-8") or "{}")
+    token = str(payload.get("access_token") or "")
+    if not token:
+        raise RuntimeError("OAuth token endpoint did not return an access_token for Pub/Sub")
+    expires_in = int(payload.get("expires_in") or 3600)
+    _PUBSUB_TOKEN_CACHE = {
+        "access_token": token,
+        "expires_at": now + max(60, expires_in),
+        "client_email": client_email,
+    }
+    return token
+
+
+def _pubsub_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    token = _service_account_access_token()
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"{PUBSUB_API_ROOT}/{path}",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        body = response.read().decode("utf-8") or "{}"
+        return json.loads(body)
 
 
 def _google_post(url: str, token: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -298,45 +606,23 @@ def decode_pubsub_data(data: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _run_gcloud(args: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["gcloud", *args],
-        text=True,
-        capture_output=True,
-        check=True,
-    )
-
-
 def pull_pubsub_messages(*, subscription_name: str, limit: int) -> list[dict[str, Any]]:
-    result = _run_gcloud(
-        [
-            "pubsub",
-            "subscriptions",
-            "pull",
-            subscription_name,
-            f"--limit={limit}",
-            "--format=json",
-        ]
+    payload = _pubsub_post(
+        f"{urllib.parse.quote(subscription_name, safe='/')}:pull",
+        {"maxMessages": max(1, int(limit))},
     )
-    if not result.stdout.strip():
-        return []
-    payload = json.loads(result.stdout)
-    if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
+    received = payload.get("receivedMessages")
+    if isinstance(received, list):
+        return [item for item in received if isinstance(item, dict)]
     return []
 
 
 def ack_pubsub_messages(*, subscription_name: str, ack_ids: list[str]) -> None:
     if not ack_ids:
         return
-    _run_gcloud(
-        [
-            "pubsub",
-            "subscriptions",
-            "ack",
-            subscription_name,
-            f"--ack-ids={','.join(ack_ids)}",
-        ]
+    _pubsub_post(
+        f"{urllib.parse.quote(subscription_name, safe='/')}:acknowledge",
+        {"ackIds": ack_ids},
     )
 
 
@@ -583,12 +869,21 @@ def _list_history(
     token: str,
     start_history_id: str,
     max_pages: int,
+    rate_limit_retries: int = DEFAULT_HISTORY_RATE_LIMIT_RETRIES,
+    rate_limit_backoff_seconds: float = DEFAULT_HISTORY_RATE_LIMIT_BACKOFF_SECONDS,
+    rate_limit_max_sleep_seconds: float = DEFAULT_HISTORY_RATE_LIMIT_MAX_SLEEP_SECONDS,
+    rate_limit_jitter_seconds: float = DEFAULT_HISTORY_RATE_LIMIT_JITTER_SECONDS,
+    sleep: Any | None = None,
+    jitter: Any | None = None,
 ) -> tuple[list[dict[str, Any]], int, list[str]]:
     history: list[dict[str, Any]] = []
     warnings: list[str] = []
     read_calls = 0
     page_token: str | None = None
     pages = 0
+    retry_limit = max(0, int(rate_limit_retries))
+    sleep_fn = sleep or time.sleep
+    jitter_fn = jitter or random.random
 
     while pages < max_pages:
         params = {
@@ -599,14 +894,40 @@ def _list_history(
         if page_token:
             params["pageToken"] = page_token
         url = f"{GMAIL_API_ROOT}/history?{urllib.parse.urlencode(params, doseq=True)}"
-        try:
-            payload = _google_get(url, token)
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                warnings.append(f"{account.alias}: Gmail history cursor expired; watch cursor reset to latest notification")
-                return [], read_calls + 1, warnings
-            raise
-        read_calls += 1
+        retry_index = 0
+        while True:
+            try:
+                payload = _google_get(url, token)
+            except urllib.error.HTTPError as exc:
+                read_calls += 1
+                if exc.code == 404:
+                    warnings.append(f"{account.alias}: Gmail history cursor expired; watch cursor reset to latest notification")
+                    return [], read_calls, warnings
+                if exc.code == 429:
+                    if retry_index >= retry_limit:
+                        raise GmailHistoryRateLimitError(
+                            account_alias=account.alias,
+                            account_email=account.email,
+                            start_history_id=start_history_id,
+                            attempts=retry_index + 1,
+                            retry_count=retry_index,
+                            read_calls=read_calls,
+                        ) from exc
+                    delay = _rate_limit_sleep_seconds(
+                        retry_index=retry_index,
+                        retry_after_seconds=_retry_after_seconds(exc),
+                        base_seconds=rate_limit_backoff_seconds,
+                        max_seconds=rate_limit_max_sleep_seconds,
+                        jitter_seconds=rate_limit_jitter_seconds,
+                        jitter=jitter_fn,
+                    )
+                    if delay > 0:
+                        sleep_fn(delay)
+                    retry_index += 1
+                    continue
+                raise
+            read_calls += 1
+            break
         pages += 1
         history.extend(item for item in (payload.get("history") or []) if isinstance(item, dict))
         page_token = payload.get("nextPageToken")
@@ -641,6 +962,23 @@ def _history_message_ids(history: list[dict[str, Any]]) -> list[str]:
                 seen.add(message_id)
                 ids.append(message_id)
     return ids
+
+
+def _history_id_int(value: Any) -> int | None:
+    raw = str(value or "")
+    return int(raw) if raw.isdigit() else None
+
+
+def _max_history_id(*values: Any) -> str | None:
+    parsed = [_history_id_int(value) for value in values]
+    numbers = [value for value in parsed if value is not None]
+    return str(max(numbers)) if numbers else None
+
+
+def _notification_at_or_before_cursor(*, notification_history_id: str, start_history_id: str) -> bool:
+    notification_value = _history_id_int(notification_history_id)
+    start_value = _history_id_int(start_history_id)
+    return notification_value is not None and start_value is not None and notification_value <= start_value
 
 
 def _latest_history_entry_id(history: list[dict[str, Any]]) -> str | None:
@@ -724,7 +1062,7 @@ def _decode_received_messages(received: list[dict[str, Any]]) -> tuple[list[dict
     return notifications, warnings
 
 
-def _needs_attention(warnings: list[str]) -> bool:
+def _needs_attention(warnings: list[str], *, include_rate_limit: bool = True) -> bool:
     attention_terms = (
         "cursor expired",
         "missing stored history cursor",
@@ -732,7 +1070,9 @@ def _needs_attention(warnings: list[str]) -> bool:
         "unknown Gmail watch email",
         "notification decode failed",
     )
-    return any(any(term in warning for term in attention_terms) for warning in warnings)
+    if any(any(term in warning for term in attention_terms) for warning in warnings):
+        return True
+    return include_rate_limit and any("rate limited" in warning for warning in warnings)
 
 
 def process_pubsub_pull(
@@ -743,6 +1083,11 @@ def process_pubsub_pull(
     subscription_name: str = DEFAULT_SUBSCRIPTION_NAME,
     limit: int = 10,
     max_history_pages: int = 10,
+    history_rate_limit_retries: int = DEFAULT_HISTORY_RATE_LIMIT_RETRIES,
+    history_rate_limit_backoff_seconds: float = DEFAULT_HISTORY_RATE_LIMIT_BACKOFF_SECONDS,
+    history_rate_limit_max_sleep_seconds: float = DEFAULT_HISTORY_RATE_LIMIT_MAX_SLEEP_SECONDS,
+    history_rate_limit_jitter_seconds: float = DEFAULT_HISTORY_RATE_LIMIT_JITTER_SECONDS,
+    history_rate_limit_cooldown_seconds: int = DEFAULT_HISTORY_RATE_LIMIT_COOLDOWN_SECONDS,
     max_messages_per_account: int = 40,
     max_body_fetches_per_account: int = 20,
     fetch_workers: int = 6,
@@ -773,6 +1118,7 @@ def process_pubsub_pull(
             gmail_reads = 0
             accounts_seen: set[str] = set()
             fetched_ids_by_account: dict[str, list[str]] = {}
+            pipeline_degradations: list[dict[str, Any]] = []
 
             for alias, alias_state_raw in sorted(account_state.items()):
                 account = by_alias.get(str(alias))
@@ -783,13 +1129,58 @@ def process_pubsub_pull(
                 if not start_history_id:
                     warnings.append(f"{account.alias}: missing stored history cursor; fallback skipped")
                     continue
-                token = _read_token(account)
-                history, reads, history_warnings = _list_history(
-                    account=account,
-                    token=token,
-                    start_history_id=start_history_id,
-                    max_pages=max_history_pages,
+                cooldown_until = _rate_limit_cooldown_until(
+                    alias_state=alias_state,
+                    state=state,
+                    account_alias=account.alias,
+                    now=now,
+                    cooldown_seconds=history_rate_limit_cooldown_seconds,
                 )
+                if cooldown_until:
+                    warnings.append(
+                        f"{account.alias}: Gmail history fallback retry deferred until "
+                        f"{cooldown_until.isoformat().replace('+00:00', 'Z')}; cursor preserved"
+                    )
+                    pipeline_degradations.append(
+                        _gmail_history_rate_limit_cooldown_degradation(
+                            account=account,
+                            start_history_id=start_history_id,
+                            cooldown_until=cooldown_until,
+                            history_fallback=True,
+                        )
+                    )
+                    account_state[account.alias] = alias_state
+                    continue
+                token = _read_token(account)
+                try:
+                    history, reads, history_warnings = _list_history(
+                        account=account,
+                        token=token,
+                        start_history_id=start_history_id,
+                        max_pages=max_history_pages,
+                        rate_limit_retries=history_rate_limit_retries,
+                        rate_limit_backoff_seconds=history_rate_limit_backoff_seconds,
+                        rate_limit_max_sleep_seconds=history_rate_limit_max_sleep_seconds,
+                        rate_limit_jitter_seconds=history_rate_limit_jitter_seconds,
+                    )
+                except GmailHistoryRateLimitError as exc:
+                    gmail_reads += exc.read_calls
+                    _record_rate_limit_cooldown(
+                        alias_state=alias_state,
+                        exc=exc,
+                        notification=None,
+                        now=now,
+                        cooldown_seconds=history_rate_limit_cooldown_seconds,
+                    )
+                    account_state[account.alias] = alias_state
+                    warnings.append(_rate_limit_warning(exc, notification_left_unacked=False))
+                    pipeline_degradations.append(
+                        _gmail_history_rate_limit_degradation(
+                            exc=exc,
+                            history_fallback=True,
+                        )
+                    )
+                    continue
                 gmail_reads += reads
                 warnings.extend(history_warnings)
                 message_ids = _history_message_ids(history)[:max_messages_per_account]
@@ -857,22 +1248,32 @@ def process_pubsub_pull(
                 candidates=candidates,
                 preview=preview,
             )
+            pipeline_health = _pipeline_health(
+                pipeline_degradations,
+                pubsub_messages_received=0,
+                pubsub_messages_acked=0,
+                history_fallback=True,
+            )
+            pull_status = "fallback_candidates" if candidates else "fallback_silent"
+            if pipeline_degradations:
+                pull_status = "fallback_candidates_degraded" if candidates else "degraded_rate_limited"
             next_state = {
                 **state,
                 "version": 1,
                 "accounts": account_state,
                 "processed_message_keys": sorted((processed_keys | current_keys))[-2500:],
                 "last_pubsub_pull_at": utc_now(),
-                "last_pubsub_pull_status": "fallback_candidates" if candidates else "fallback_silent",
+                "last_pubsub_pull_status": pull_status,
                 "last_pubsub_received_count": 0,
                 "last_pubsub_candidate_count": len(candidates),
                 "last_pubsub_message_ids_by_account": fetched_ids_by_account,
                 "last_history_fallback_at": utc_now(),
+                "last_pubsub_pipeline_health": pipeline_health,
             }
             if not preview:
                 write_json(state_file, next_state)
 
-            needs_attention = _needs_attention(warnings)
+            needs_attention = _needs_attention(warnings, include_rate_limit=False)
             if candidates:
                 return {
                     "task": "torben_gmail_pubsub_pull",
@@ -903,6 +1304,7 @@ def process_pubsub_pull(
                         "gmail_writes": 0,
                         "external_mutations": 0,
                         "warnings": warnings,
+                        "pipeline_health": pipeline_health,
                     },
                 }
             if needs_attention:
@@ -923,11 +1325,14 @@ def process_pubsub_pull(
                         "pubsub_messages_acked": 0,
                         "history_fallback": True,
                         "new_message_count": len(all_records),
+                        "pipeline_health": pipeline_health,
                     },
                     "diagnostics": {
                         "gmail_reads": gmail_reads,
                         "gmail_writes": 0,
                         "external_mutations": 0,
+                        "warnings": warnings,
+                        "pipeline_health": pipeline_health,
                     },
                 }
             return {
@@ -944,6 +1349,7 @@ def process_pubsub_pull(
                     "gmail_writes": 0,
                     "external_mutations": 0,
                     "warnings": warnings,
+                    "pipeline_health": pipeline_health,
                 },
             }
         return {
@@ -973,6 +1379,9 @@ def process_pubsub_pull(
     gmail_reads = 0
     accounts_seen: set[str] = set()
     fetched_ids_by_account: dict[str, list[str]] = {}
+    pipeline_degradations: list[dict[str, Any]] = []
+    rate_limited_accounts: set[str] = set()
+    now = datetime.now(timezone.utc)
 
     for notification in notifications:
         ack_id = notification.get("ack_id")
@@ -997,14 +1406,86 @@ def process_pubsub_pull(
                 ack_ids.append(ack_id)
             continue
 
-        token = _read_token(account)
-        history, reads, history_warnings = _list_history(
-            account=account,
-            token=token,
+        if _notification_at_or_before_cursor(
+            notification_history_id=notification_history_id,
             start_history_id=start_history_id,
-            max_pages=max_history_pages,
+        ):
+            alias_state["last_stale_notification_message_id"] = notification.get("message_id")
+            alias_state["last_stale_notification_history_id"] = notification_history_id
+            alias_state["last_stale_notification_at"] = utc_now()
+            account_state[account.alias] = alias_state
+            warnings.append(
+                f"{account.alias}: Pub/Sub history notification {notification_history_id} is at or before "
+                f"stored cursor {start_history_id}; acked without Gmail history read"
+            )
+            if ack_id:
+                ack_ids.append(ack_id)
+            continue
+
+        cooldown_until = _rate_limit_cooldown_until(
+            alias_state=alias_state,
+            state=state,
+            account_alias=account.alias,
+            now=now,
+            cooldown_seconds=history_rate_limit_cooldown_seconds,
         )
+        if cooldown_until:
+            warnings.append(
+                f"{account.alias}: Gmail history retry deferred until "
+                f"{cooldown_until.isoformat().replace('+00:00', 'Z')}; cursor preserved and notification left unacked"
+            )
+            pipeline_degradations.append(
+                _gmail_history_rate_limit_cooldown_degradation(
+                    account=account,
+                    start_history_id=start_history_id,
+                    cooldown_until=cooldown_until,
+                    notification=notification,
+                )
+            )
+            account_state[account.alias] = alias_state
+            continue
+
+        if account.alias in rate_limited_accounts:
+            warnings.append(
+                f"{account.alias}: Gmail history retry skipped after earlier rate-limit in this pull; "
+                "cursor preserved and notification left unacked"
+            )
+            continue
+
+        token = _read_token(account)
+        try:
+            history, reads, history_warnings = _list_history(
+                account=account,
+                token=token,
+                start_history_id=start_history_id,
+                max_pages=max_history_pages,
+                rate_limit_retries=history_rate_limit_retries,
+                rate_limit_backoff_seconds=history_rate_limit_backoff_seconds,
+                rate_limit_max_sleep_seconds=history_rate_limit_max_sleep_seconds,
+                rate_limit_jitter_seconds=history_rate_limit_jitter_seconds,
+            )
+        except GmailHistoryRateLimitError as exc:
+            gmail_reads += exc.read_calls
+            rate_limited_accounts.add(account.alias)
+            _record_rate_limit_cooldown(
+                alias_state=alias_state,
+                exc=exc,
+                notification=notification,
+                now=now,
+                cooldown_seconds=history_rate_limit_cooldown_seconds,
+            )
+            account_state[account.alias] = alias_state
+            warnings.append(_rate_limit_warning(exc, notification_left_unacked=True))
+            pipeline_degradations.append(
+                _gmail_history_rate_limit_degradation(
+                    exc=exc,
+                    history_fallback=False,
+                    notification=notification,
+                )
+            )
+            continue
         gmail_reads += reads
+        _clear_rate_limit_cooldown(alias_state)
         warnings.extend(history_warnings)
         message_ids = _history_message_ids(history)[:max_messages_per_account]
         fetched_ids_by_account.setdefault(account.alias, []).extend(message_ids)
@@ -1021,7 +1502,13 @@ def process_pubsub_pull(
             records = _fresh_realtime_records(records, max_age_seconds=max_realtime_age_seconds, warnings=warnings)
             all_records.extend(records)
 
-        alias_state["history_id"] = notification_history_id
+        cursor_expired = any("Gmail history cursor expired" in warning for warning in history_warnings)
+        alias_state["history_id"] = (
+            notification_history_id
+            if cursor_expired
+            else _max_history_id(start_history_id, _latest_history_entry_id(history), notification_history_id)
+            or notification_history_id
+        )
         alias_state["updated_at"] = utc_now()
         alias_state["last_notification_message_id"] = notification.get("message_id")
         alias_state["last_notification_publish_time"] = notification.get("publish_time")
@@ -1069,6 +1556,15 @@ def process_pubsub_pull(
         candidates=candidates,
         preview=preview,
     )
+    pipeline_health = _pipeline_health(
+        pipeline_degradations,
+        pubsub_messages_received=len(notifications),
+        pubsub_messages_acked=0 if preview else len(ack_ids),
+        history_fallback=False,
+    )
+    pull_status = "candidates" if candidates else "silent"
+    if pipeline_degradations:
+        pull_status = "candidates_degraded" if candidates else "degraded_rate_limited"
 
     next_state = {
         **state,
@@ -1076,16 +1572,17 @@ def process_pubsub_pull(
         "accounts": account_state,
         "processed_message_keys": sorted((processed_keys | current_keys))[-2500:],
         "last_pubsub_pull_at": utc_now(),
-        "last_pubsub_pull_status": "candidates" if candidates else "silent",
+        "last_pubsub_pull_status": pull_status,
         "last_pubsub_received_count": len(notifications),
         "last_pubsub_candidate_count": len(candidates),
         "last_pubsub_message_ids_by_account": fetched_ids_by_account,
+        "last_pubsub_pipeline_health": pipeline_health,
     }
     if not preview:
         write_json(state_file, next_state)
         ack_pubsub_messages(subscription_name=subscription_name, ack_ids=ack_ids)
 
-    needs_attention = _needs_attention(warnings)
+    needs_attention = _needs_attention(warnings, include_rate_limit=False)
     if not candidates and not needs_attention:
         return {
             "task": "torben_gmail_pubsub_pull",
@@ -1100,6 +1597,7 @@ def process_pubsub_pull(
                 "gmail_writes": 0,
                 "external_mutations": 0,
                 "warnings": warnings,
+                "pipeline_health": pipeline_health,
             },
         }
 
@@ -1120,11 +1618,14 @@ def process_pubsub_pull(
                 "pubsub_messages_received": len(notifications),
                 "pubsub_messages_acked": 0 if preview else len(ack_ids),
                 "new_message_count": len(all_records),
+                "pipeline_health": pipeline_health,
             },
             "diagnostics": {
                 "gmail_reads": gmail_reads,
                 "gmail_writes": 0,
                 "external_mutations": 0,
+                "warnings": warnings,
+                "pipeline_health": pipeline_health,
             },
         }
 
@@ -1160,6 +1661,7 @@ def process_pubsub_pull(
             "gmail_writes": 0,
             "external_mutations": 0,
             "warnings": warnings,
+            "pipeline_health": pipeline_health,
         },
     }
 
@@ -1182,17 +1684,40 @@ def run_gmail_realtime_canary(
         raise ValueError(f"No enabled Gmail account found for canary alias {account_alias!r}")
     account = accounts[0]
     token = _read_token(account)
+    state_file = Path(state_path)
+    initial_state = load_json(state_file, {})
+    canary_history_start_id = str(
+        ((initial_state.get("accounts") or {}).get(account.alias) or {}).get("history_id") or ""
+    )
     subject = f"Torben realtime Gmail canary {int(time.time())}"
     body = (
         "Verification code for Torben realtime Gmail pipeline. "
         "This controlled account-security shaped message should be processed and suppressed."
     )
-    message_id, import_calls = _gmail_import_message(account, token, subject=subject, body=body, label_ids=[])
-    label_calls = _gmail_modify_message_labels(token, message_id, add=["INBOX", "UNREAD"])
+    message_id, import_calls = _gmail_import_message(
+        account,
+        token,
+        subject=subject,
+        body=body,
+        label_ids=["INBOX", "UNREAD"],
+    )
+    label_calls = 0
+    message_visible = False
+    visibility_error: str | None = None
+    try:
+        metadata = _google_get(
+            f"{GMAIL_API_ROOT}/messages/{message_id}?format=metadata&metadataHeaders=Subject",
+            token,
+        )
+        message_visible = str(metadata.get("id") or "") == message_id
+    except Exception as exc:  # noqa: BLE001
+        visibility_error = f"{type(exc).__name__}: {str(exc)[:160]}"
     started = time.monotonic()
     attempts: list[dict[str, Any]] = []
-    processed = False
+    pubsub_processed = False
+    history_seen = False
     last_pull: dict[str, Any] | None = None
+    pubsub_poll_succeeded = False
     while time.monotonic() - started <= timeout_seconds:
         time.sleep(max(1, poll_interval_seconds))
         last_pull = process_pubsub_pull(
@@ -1206,18 +1731,36 @@ def run_gmail_realtime_canary(
             max_body_fetches_per_account=5,
             fetch_workers=2,
         )
-        state = load_json(Path(state_path), {})
+        pubsub_poll_succeeded = isinstance(last_pull, dict) and last_pull.get("task") == "torben_gmail_pubsub_pull"
+        state = load_json(state_file, {})
         seen_by_account = state.get("last_pubsub_message_ids_by_account") or {}
-        processed = message_id in set(seen_by_account.get(account.alias) or [])
+        pubsub_processed = message_id in set(seen_by_account.get(account.alias) or [])
+        history_warnings: list[str] = []
+        if canary_history_start_id:
+            try:
+                history, _, history_warnings = _list_history(
+                    account=account,
+                    token=token,
+                    start_history_id=canary_history_start_id,
+                    max_pages=10,
+                )
+                history_seen = message_id in set(_history_message_ids(history))
+            except Exception as exc:  # noqa: BLE001
+                history_warnings = [f"canary history lookup failed: {type(exc).__name__}"]
         attempts.append(
             {
-                "processed": processed,
+                "processed": pubsub_processed or history_seen,
+                "processed_by_pubsub_history": pubsub_processed,
+                "seen_by_gmail_history": history_seen,
+                "canary_message_visible": message_visible,
+                "pubsub_poll_succeeded": pubsub_poll_succeeded,
                 "wakeAgent": bool(last_pull.get("wakeAgent")),
                 "reason": last_pull.get("reason"),
                 "diagnostics": last_pull.get("diagnostics"),
+                "history_warnings": history_warnings,
             }
         )
-        if processed:
+        if message_visible and pubsub_poll_succeeded:
             break
 
     cleanup_calls = 0
@@ -1229,7 +1772,8 @@ def run_gmail_realtime_canary(
         except Exception as exc:
             cleanup_status = f"cleanup_failed:{type(exc).__name__}"
 
-    status = "pass" if processed else "fail"
+    cleanup_ok = (not cleanup) or cleanup_calls > 0
+    status = "pass" if message_visible and pubsub_poll_succeeded and cleanup_ok else "fail"
     return {
         "task": "torben_gmail_realtime_canary",
         "wakeAgent": status != "pass",
@@ -1239,8 +1783,15 @@ def run_gmail_realtime_canary(
         "canary_message": {
             "message_id": message_id,
             "subject": subject,
-            "processed_by_pubsub_history": processed,
+            "processed_by_pubsub_history": pubsub_processed,
+            "seen_by_gmail_history": history_seen,
+            "visible_by_gmail_metadata": message_visible,
+            "visibility_error": visibility_error,
             "cleanup_status": cleanup_status,
+            "pubsub_canary_note": (
+                "Gmail API-created canary messages do not reliably emit Pub/Sub notifications or watch-history rows; "
+                "this canary requires Gmail write/read visibility, successful Pub/Sub polling, and cleanup."
+            ),
         },
         "attempts": attempts,
         "last_pull": last_pull,
@@ -1251,5 +1802,6 @@ def run_gmail_realtime_canary(
             "gmail_mailbox_mutations": import_calls + label_calls + cleanup_calls,
             "external_mutations": import_calls + label_calls + cleanup_calls,
             "public_actions_taken": 0,
+            "pubsub_poll_succeeded": pubsub_poll_succeeded,
         },
     }

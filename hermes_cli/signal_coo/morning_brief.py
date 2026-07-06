@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -15,6 +16,15 @@ BRIEF_RULES = [
     "Research instead of summarizing when the claim depends on outside context.",
     "If the brief does not know something, say so instead of guessing.",
 ]
+GENERIC_ATTENDEE_DOMAINS = {
+    "gmail.com",
+    "googlemail.com",
+    "icloud.com",
+    "me.com",
+    "outlook.com",
+    "hotmail.com",
+    "yahoo.com",
+}
 
 
 def _local(value: datetime) -> datetime:
@@ -67,11 +77,161 @@ def _open_blocks(events: list[dict[str, Any]], now: datetime) -> list[dict[str, 
     return blocks[:4]
 
 
+def _clean_words(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _attendee_email(attendee: dict[str, Any]) -> str:
+    return str(attendee.get("email") or "").strip().lower()
+
+
+def _attendee_label(attendee: dict[str, Any]) -> str:
+    email = _attendee_email(attendee)
+    return _clean_words(attendee.get("display_name")) or email
+
+
+def _event_attendees(event: dict[str, Any]) -> list[dict[str, Any]]:
+    attendees = [item for item in (event.get("attendees") or []) if isinstance(item, dict)]
+    account_email = str(event.get("account_email") or "").strip().lower()
+    external: list[dict[str, Any]] = []
+    for attendee in attendees:
+        email = _attendee_email(attendee)
+        if email and email == account_email:
+            continue
+        external.append(
+            {
+                "name": _attendee_label(attendee),
+                "email": email,
+                "domain": email.split("@", 1)[1] if "@" in email else "",
+                "response_status": str(attendee.get("response_status") or ""),
+                "organizer": bool(attendee.get("organizer")),
+            }
+        )
+    return external[:8]
+
+
+def _event_domains(attendees: list[dict[str, Any]]) -> list[str]:
+    domains: list[str] = []
+    for attendee in attendees:
+        domain = str(attendee.get("domain") or "").strip().lower()
+        if domain and domain not in domains:
+            domains.append(domain)
+    return domains
+
+
+def _relationship_context_matches(event: dict[str, Any], relationship_context: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not relationship_context:
+        return []
+    event_text = " ".join(
+        [
+            str(event.get("summary") or ""),
+            str(event.get("title") or ""),
+            str(event.get("description") or ""),
+            " ".join(_attendee_label(item) for item in (event.get("attendees") or []) if isinstance(item, dict)),
+            " ".join(_attendee_email(item) for item in (event.get("attendees") or []) if isinstance(item, dict)),
+        ]
+    ).lower()
+    matches: list[dict[str, Any]] = []
+    for person in relationship_context.get("people") or []:
+        if not isinstance(person, dict):
+            continue
+        aliases = [person.get("name"), *(person.get("aliases") or []), *(person.get("emails") or [])]
+        if not any(str(alias or "").strip().lower() and str(alias or "").strip().lower() in event_text for alias in aliases):
+            continue
+        matches.append(
+            {
+                "name": person.get("name"),
+                "role": person.get("role"),
+                "importance": person.get("importance") or "medium",
+                "notes": person.get("notes"),
+                "surface_when": list(person.get("surface_when") or []),
+            }
+        )
+    return matches[:5]
+
+
+def _company_context_hint(domains: list[str], relationship_context: dict[str, Any] | None) -> str:
+    source_rules = (relationship_context or {}).get("source_rules") or {}
+    hints: list[str] = []
+    for domain in domains:
+        if domain in GENERIC_ATTENDEE_DOMAINS:
+            continue
+        rule = source_rules.get(domain) if isinstance(source_rules, dict) else None
+        if isinstance(rule, dict) and rule.get("description"):
+            hints.append(f"{domain}: {rule.get('description')}")
+        elif isinstance(rule, dict) and rule.get("reason"):
+            hints.append(f"{domain}: {rule.get('reason')}")
+        else:
+            hints.append(f"{domain}: external attendee domain; company context not yet verified")
+    return "; ".join(hints[:3])
+
+
+def build_meeting_signal_packets(
+    events: list[dict[str, Any]],
+    *,
+    relationship_context: dict[str, Any] | None = None,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Package weak meeting evidence for LLM judgment without inventing agenda context."""
+
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    packets: list[dict[str, Any]] = []
+    for event in _events_for_today(events, now)[:12]:
+        attendees = _event_attendees(event)
+        domains = _event_domains(attendees)
+        relationship_matches = _relationship_context_matches(event, relationship_context)
+        description = _clean_words(event.get("description"))
+        goal = _clean_words(event.get("goal"))
+        last_conversation = _clean_words(event.get("last_conversation"))
+        recommended_line = _clean_words(event.get("recommended_line"))
+        unknowns: list[str] = []
+        if not description:
+            unknowns.append("invite agenda")
+        if not relationship_matches:
+            unknowns.append("person/company context")
+        if last_conversation.startswith("calendar context only"):
+            unknowns.append("prior conversation summary")
+        known_context: list[str] = []
+        if goal and goal != "to protect the calendar commitment and arrive prepared":
+            known_context.append(goal)
+        if last_conversation and not last_conversation.startswith("calendar context only"):
+            known_context.append(last_conversation)
+        if description:
+            known_context.append(description[:240])
+        for match in relationship_matches:
+            label = _clean_words(match.get("name"))
+            role = _clean_words(match.get("role"))
+            notes = _clean_words(match.get("notes"))
+            if label and role:
+                known_context.append(f"{label}: {role}")
+            if notes:
+                known_context.append(notes[:180])
+        confidence = "high" if relationship_matches and known_context else "medium" if attendees or domains else "low"
+        packets.append(
+            {
+                "summary": event.get("summary") or event.get("title") or "Busy",
+                "time": _format_window(event.get("start_at"), event.get("end_at")),
+                "attendees": attendees,
+                "domains": domains,
+                "known_context": known_context[:6],
+                "company_context_hint": _company_context_hint(domains, relationship_context),
+                "unknowns": unknowns[:5],
+                "suggested_question": recommended_line
+                or "What would make this worth continuing, and what would block it?",
+                "confidence": confidence,
+                "relationship_matches": relationship_matches,
+                "evidence_ids": list(event.get("evidence_ids") or []),
+            }
+        )
+    return packets
+
+
 def build_morning_brief_scope(
     ea_evidence: dict[str, Any],
     *,
     now: datetime | None = None,
     north_star: str = "advance the highest-leverage founder work before the inbox takes over",
+    relationship_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     events = list(ea_evidence.get("calendar_events") or [])
@@ -107,6 +267,11 @@ def build_morning_brief_scope(
         )
 
     meetings: list[dict[str, Any]] = []
+    meeting_signal_packets = build_meeting_signal_packets(
+        todays_events,
+        relationship_context=relationship_context,
+        now=now,
+    )
     for event in todays_events[:12]:
         meetings.append(
             {
@@ -169,6 +334,7 @@ def build_morning_brief_scope(
             "specific_90_second_move": "Use today's external meeting prep first; do not invent a people-risk signal.",
         },
         "meetings": meetings,
+        "meeting_signal_packets": meeting_signal_packets,
         "world": {
             "summary": "World scan is delegated to GTM/Magnus research; no live research source is attached to this EA-only evidence run.",
             "status": "placeholder",

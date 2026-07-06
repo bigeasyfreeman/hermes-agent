@@ -99,6 +99,14 @@ def test_engagement_radar_stages_draft_only_reply_opportunities_and_dedupes(tmp_
 
     assert first["wakeAgent"] is True
     assert first["selected_count"] == 1
+    assert first["status"] == "staged"
+    assert first["posted"] == 0
+    assert first["replied"] == 0
+    assert first["scheduled"] == 0
+    assert first["sent"] == 0
+    assert first["approval_status"] == "approval_required"
+    assert first["suggested_action"] == "draft_reply"
+    assert first["source_refs"] == ["https://x.com/example/status/1", "https://arxiv.org/abs/2606.24402"]
     assert first["public_actions_taken"] == 0
     assert first["external_mutations"] == 0
     assert first["llm_judge"]["invoked"] is True

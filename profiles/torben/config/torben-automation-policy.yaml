@@ -1,0 +1,99 @@
+schema_version: 1
+policy_id: torben-automation-policy-20260627
+mode: fail_closed
+
+gtm:
+  auto_invoke:
+    radar: true
+    engagement_radar: true
+    draft_content: true
+    draft_reply: true
+  recommendations:
+    auto_surface: true
+    max_items_per_run: 3
+  delivery_cooldown_minutes: 45
+  public_mutations:
+    enabled: false
+    allowed_accounts: []
+    allowed_content_types: []
+    max_risk_class: medium
+    approval_mode: explicit_signal_handle
+    rollback_path: docs/operations/torben-gtm-public-write-runbook.md
+    audit_log_path: state/torben-public-write-audit.jsonl
+
+ea:
+  auto_invoke:
+    recommendation_surface: true
+    relationship_learning_question: true
+  relationship_learning:
+    auto_capture_questions: true
+    act_requires_answer_or_trusted_source: true
+    write_path: config/learned_contacts.yaml
+  mutations:
+    email_send:
+      enabled: false
+      allowed_senders: []
+      allowed_domains: []
+      max_per_run: 0
+      approval_mode: explicit_signal_handle
+      dry_run_required: true
+      audit_log_path: state/torben-email-mutation-audit.jsonl
+    email_archive_delete_label:
+      enabled: false
+      allowed_senders: []
+      allowed_domains: []
+      max_per_run: 0
+      approval_mode: explicit_signal_handle
+      dry_run_required: true
+      audit_log_path: state/torben-email-hygiene-audit.jsonl
+    calendar_edit:
+      enabled: false
+      allowed_calendars: []
+      allowed_event_types: []
+      max_per_run: 0
+      approval_mode: explicit_signal_handle
+      dry_run_required: true
+      audit_log_path: state/torben-calendar-mutation-audit.jsonl
+
+finance:
+  auto_invoke:
+    research_refresh: true
+    recommendation_surface: true
+    paper_canary: true
+    monarch_daily_savings: true
+    monarch_weekly_savings: true
+  monarch_research:
+    enabled: true
+    required_read_tools:
+      - GetTransactions
+      - GetRecurring
+      - GetSpendingByCategory
+      - GetBudget
+      - GetCashFlow
+      - GetAccounts
+      - GetMerchants
+      - GetCategories
+      - GetTags
+      - ListRules
+    max_transactions_per_run: 200
+    redact_raw_transactions: true
+    write_latest_artifact: true
+    stage_fin_review_handles: true
+  monarch_mutations:
+    enabled: false
+    allowed_tools: []
+    max_writes_per_run: 0
+    approval_mode: explicit_signal_handle
+    dry_run_required: true
+    audit_log_path: state/torben-monarch-mutation-audit.jsonl
+  live_orders:
+    enabled: false
+    allowed_accounts: []
+    allowed_symbols: []
+    max_notional_usd: 0
+    max_orders_per_run: 0
+    approval_mode: scoped_live_trading_policy
+    requires_mandate: true
+    requires_kill_switch: true
+    requires_reconciliation: true
+    audit_log_path: state/torben-finance-live-order-audit.jsonl

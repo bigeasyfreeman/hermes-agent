@@ -444,6 +444,16 @@ class TestSanePathIncludesHomebrew:
         # Original entries keep their leading precedence.
         assert path_entries[:4] == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
 
+    def test_sanitize_subprocess_env_real_launchd_path_gains_homebrew(self):
+        """Cron scripts use the sanitizer directly, so it needs sane PATH too."""
+        from tools.environments.local import _sanitize_subprocess_env
+        launchd_env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
+        result = _sanitize_subprocess_env(launchd_env)
+        path_entries = result["PATH"].split(":")
+        assert "/opt/homebrew/bin" in path_entries
+        assert "/opt/homebrew/sbin" in path_entries
+        assert path_entries[:4] == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+
     def test_make_run_env_collapses_duplicate_caller_entries(self):
         """Duplicates already present in the caller PATH are de-duplicated."""
         from tools.environments.local import _make_run_env

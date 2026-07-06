@@ -14,6 +14,7 @@ from typing import Any
 
 
 DEFAULT_TTL_DAYS = 14
+DEFAULT_SIGNAL_LEDGER_TTL_DAYS = 30
 TRACKING_PARAMS = {
     "utm_source",
     "utm_medium",
@@ -84,6 +85,20 @@ def finding_fingerprint(item: dict[str, Any], *, kind: str) -> str:
         raw = f"{kind}:title:{source}:{title}"
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
     return f"finding:{digest}"
+
+
+def signal_candidate_fingerprint(item: dict[str, Any], *, kind: str) -> str:
+    link = item.get("link") if isinstance(item.get("link"), dict) else {}
+    url = canonical_url(link.get("url") if isinstance(link, dict) else None)
+    if url:
+        raw = f"{kind}:url:{url}"
+    else:
+        evidence = "|".join(str(value) for value in (item.get("evidence_ids") or [])[:3])
+        title = _normalize_text(str(item.get("title") or item.get("summary") or item.get("subject") or ""))
+        source = _normalize_text(str(item.get("source") or ""))
+        raw = f"{kind}:candidate:{source}:{title}:{evidence}"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+    return f"llm-signal:{digest}"
 
 
 @dataclass
@@ -178,4 +193,91 @@ def filter_new_findings(
         "ledger_path": str(ledger.path),
         "ttl_days": ttl_days,
         "dry_run": dry_run,
+    }
+
+
+def record_llm_signal_candidates(
+    *,
+    ledger_path: str | Path,
+    rubric_hash: str,
+    stories: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    meeting_packets: list[dict[str, Any]] | None = None,
+    ttl_days: int = DEFAULT_SIGNAL_LEDGER_TTL_DAYS,
+    now: datetime | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Record bounded candidates offered to the LLM under a rubric hash.
+
+    This intentionally does not claim to know the final Signal prose selection.
+    It gives future tuning a durable record of the evidence surface the LLM saw.
+    """
+
+    path = Path(ledger_path)
+    current = (now or _utc_now()).astimezone(timezone.utc)
+    if path.exists():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8") or "{}")
+        except Exception:
+            payload = {}
+    else:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    cutoff = current - timedelta(days=ttl_days)
+    candidates: dict[str, Any] = {}
+    for fingerprint, record in (payload.get("candidates") or {}).items():
+        if not isinstance(record, dict):
+            continue
+        last_seen = _parse_time(record.get("last_seen_at")) or _parse_time(record.get("first_seen_at"))
+        if last_seen and last_seen >= cutoff:
+            candidates[str(fingerprint)] = record
+
+    offered: list[dict[str, Any]] = []
+
+    def add_candidate(item: dict[str, Any], *, kind: str) -> None:
+        fingerprint = signal_candidate_fingerprint(item, kind=kind)
+        link = item.get("link") if isinstance(item.get("link"), dict) else {}
+        record = {
+            "candidate_fingerprint": fingerprint,
+            "source_kind": kind,
+            "title": item.get("title") or item.get("summary") or item.get("subject"),
+            "source": item.get("source"),
+            "best_link": canonical_url(link.get("url") if isinstance(link, dict) else None),
+            "rubric_hash": rubric_hash,
+            "decision": "offered_to_llm",
+            "reason": item.get("one_sentence") or item.get("suggested_question") or item.get("reason"),
+            "evidence_ids": list(item.get("evidence_ids") or []),
+            "first_seen_at": candidates.get(fingerprint, {}).get("first_seen_at") or _iso(current),
+            "last_seen_at": _iso(current),
+        }
+        candidates[fingerprint] = record
+        offered.append(record)
+
+    for story in stories:
+        add_candidate(story, kind="story")
+    for tool in tools:
+        add_candidate(tool, kind="tool")
+    for meeting in meeting_packets or []:
+        add_candidate(meeting, kind="meeting")
+
+    updated = {
+        "version": 1,
+        "updated_at": _iso(current),
+        "ttl_days": ttl_days,
+        "rubric_hash": rubric_hash,
+        "candidates": candidates,
+    }
+    if not dry_run:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(updated, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    return {
+        "ledger_path": str(path),
+        "ttl_days": ttl_days,
+        "rubric_hash": rubric_hash,
+        "dry_run": dry_run,
+        "candidate_count": len(offered),
+        "offered": offered[:50],
     }

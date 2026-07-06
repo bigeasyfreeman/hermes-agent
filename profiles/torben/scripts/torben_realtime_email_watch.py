@@ -273,7 +273,7 @@ def main() -> int:
         for index, candidate in enumerate(candidates, start=1):
             candidate["handle"] = f"PREVIEW-{index:03d}"
     else:
-        ledger = ActionLedger(state_dir / "torben-action-ledger.json")
+        ledger = ActionLedger(state_dir / "torben-action-ledger.jsonl")
         existing_handles = _existing_evidence_handles(ledger)
         learn_candidates = [candidate for candidate in candidates if candidate.get("action_kind") == "learn_contact"]
         staged_learn = {
@@ -347,4 +347,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from torben_job_contract import run_job
+
+    raise SystemExit(run_job("torben-realtime-email-watch", main))

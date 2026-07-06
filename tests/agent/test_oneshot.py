@@ -13,6 +13,12 @@ from agent.oneshot import (
 )
 
 
+def _oneshot_module():
+    import agent.oneshot as oneshot
+
+    return oneshot
+
+
 class TestRenderTemplate:
     def test_unknown_template_raises(self):
         with pytest.raises(KeyError):
@@ -66,7 +72,7 @@ class TestRunOneshot:
             "agent.oneshot.call_llm",
             return_value=self._mock_response("feat: add thing"),
         ) as llm:
-            out = run_oneshot(template="commit_message", variables={"diff": "d"})
+            out = _oneshot_module().run_oneshot(template="commit_message", variables={"diff": "d"})
 
         assert out == "feat: add thing"
         messages = llm.call_args.kwargs["messages"]
@@ -78,7 +84,7 @@ class TestRunOneshot:
             "agent.oneshot.call_llm",
             return_value=self._mock_response("hello"),
         ) as llm:
-            out = run_oneshot(instructions="be brief", user_input="say hi")
+            out = _oneshot_module().run_oneshot(instructions="be brief", user_input="say hi")
 
         assert out == "hello"
         messages = llm.call_args.kwargs["messages"]
@@ -87,14 +93,14 @@ class TestRunOneshot:
 
     def test_requires_template_or_prompt(self):
         with pytest.raises(ValueError):
-            run_oneshot()
+            _oneshot_module().run_oneshot()
 
     def test_strips_wrapping_code_fence(self):
         with patch(
             "agent.oneshot.call_llm",
             return_value=self._mock_response("```\nfix: bug\n```"),
         ):
-            assert run_oneshot(instructions="x", user_input="y") == "fix: bug"
+            assert _oneshot_module().run_oneshot(instructions="x", user_input="y") == "fix: bug"
 
 
 class TestHelpers:

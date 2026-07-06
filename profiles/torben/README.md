@@ -29,11 +29,18 @@ draft-only reply ideas with the public X algorithm lens, and stays silent when
 there is no fresh opportunity. It does not post or reply publicly.
 
 The `torben-finance-radar` cron is the Ratatosk stage-only finance loop. It
-calls Robinhood v0.1 analysis under `/Users/ericfreeman/ratatosk`, lets Ratatosk
-mint a bounded no-tools LLM run when a market phase is due, and adapts only
-fresh above-threshold candidates into Torben `FIN-*` review handles. It stays
-silent on no due tick, below-threshold watchlist output, and duplicate
-candidates. It does not place, cancel, modify, or approve broker orders.
+scans a broad opportunity universe, not only blue-chip names, and defaults to a
+few market-day scan windows. It lets Ratatosk mint bounded no-tools LLM
+judgment only when evidence warrants it, then adapts only fresh above-threshold
+candidates into Torben `FIN-*` review handles. It stays silent on quiet scans,
+below-threshold watchlist output, and duplicate candidates. It does not place,
+cancel, modify, or approve broker orders.
+
+The `torben-weekly-behavior-audit` cron is the cross-surface learning loop. It
+reviews redacted metadata from finance, EA, GTM/content, QA, and delegation
+artifacts, then proposes review-gated skill or repo-runbook candidates only
+when a pattern is recurring, non-obvious, codifiable, and has a validation
+plan. It never installs a skill silently.
 
 Realtime Gmail is Pub/Sub-backed. `torben_gmail_watch_register.py` registers or
 renews Gmail watches for the enabled OAuth accounts, and
@@ -47,6 +54,12 @@ enabled live cron scripts must exist, compile, have clean cron error fields, and
 match the repo copy. `torben_gmail_realtime_canary.py` is manual only; it creates
 and trashes one controlled Gmail canary message to prove Pub/Sub/history
 processing end to end.
+
+`torben_memory_loop.py` is the Loopy memory-maintenance wrapper. It writes only
+to the active profile `memories/MEMORY.md`, defaults to dry-run diffs, refuses
+credential-shaped entries, and backs up before weekly review. It is intentionally
+not live-scheduled by this snapshot; create a disabled or weekly no-agent cron
+only after reviewing the first dry-run output.
 
 GTM package authoring is Grok-first through `xai-oauth`. The writer calls
 xAI's Responses API with the `x_search` tool enabled by default, then stores the

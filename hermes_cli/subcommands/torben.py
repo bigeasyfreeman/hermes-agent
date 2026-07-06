@@ -57,6 +57,31 @@ def build_torben_parser(subparsers, *, cmd_torben: Callable) -> None:
         default=None,
         help="Action ledger path (default: $HERMES_HOME/state/torben-action-ledger.jsonl)",
     )
+    resolve_reply.add_argument(
+        "--yes",
+        action="store_true",
+        help="Actually execute supported approved external mutations",
+    )
+    resolve_reply.add_argument(
+        "--approved-by",
+        default="signal-reply",
+        help="Approval source for audit history",
+    )
+    resolve_reply.add_argument(
+        "--magnus-root",
+        default="/Users/ericfreeman/magnus",
+        help="Magnus repo root for approval-gated X writer",
+    )
+    resolve_reply.add_argument(
+        "--sender",
+        default=None,
+        help="Signal sender phone number for authority-bound replies",
+    )
+    resolve_reply.add_argument(
+        "--ladder-config",
+        default=None,
+        help="Autonomy ladder config path (default: $HERMES_HOME/config/torben-autonomy-ladder.yaml)",
+    )
     resolve_reply.add_argument("--json", action="store_true", help="Print JSON output")
 
     learn_contact = torben_subparsers.add_parser(
@@ -303,6 +328,25 @@ def build_torben_parser(subparsers, *, cmd_torben: Callable) -> None:
         help="Optional ISO timestamp for deterministic tests",
     )
     gtm_reply.add_argument("--json", action="store_true", help="Print JSON output")
+
+    gtm_public_reply = torben_subparsers.add_parser(
+        "gtm-public-reply",
+        help="Send explicitly approved GTM reply handles through the X public-write guard",
+    )
+    gtm_public_reply.add_argument("reply", nargs="+", help="Approval text containing GTM handle(s)")
+    gtm_public_reply.add_argument(
+        "--ledger",
+        default=None,
+        help="Torben action ledger path (default: $HERMES_HOME/state/torben-action-ledger.jsonl)",
+    )
+    gtm_public_reply.add_argument(
+        "--magnus-root",
+        default="/Users/ericfreeman/magnus",
+        help="Magnus repo root for approval-gated X writer",
+    )
+    gtm_public_reply.add_argument("--approved-by", default="signal-reply", help="Approval source for audit history")
+    gtm_public_reply.add_argument("--yes", action="store_true", help="Actually post public X replies")
+    gtm_public_reply.add_argument("--json", action="store_true", help="Print JSON output")
 
     inbox_audit = torben_subparsers.add_parser(
         "inbox-audit",

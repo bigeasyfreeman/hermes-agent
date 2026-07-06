@@ -194,7 +194,7 @@ def main() -> int:
         radar = load_magnus_gtm_radar(radar_path)
         payload = build_torben_gtm_radar_adapter(
             radar,
-            ledger=ActionLedger(state_dir / "torben-action-ledger.json"),
+            ledger=ActionLedger(state_dir / "torben-action-ledger.jsonl"),
             state_path=state_dir / "torben-gtm-radar-adapter-state.json",
             max_items=max_items,
             mark_delivered=not preview,
@@ -202,16 +202,28 @@ def main() -> int:
         )
         if source_refresh:
             payload["source_refresh"] = source_refresh
+        payload.setdefault("packages_dir", str(state_dir / "gtm-content-packages"))
     except Exception as exc:  # noqa: BLE001
         payload = {
             "task": "torben_gtm_radar_adapter",
             "wakeAgent": True,
+            "status": "error",
             "error": {
                 "type": type(exc).__name__,
                 "message": str(exc)[:300],
             },
+            "posted": 0,
+            "replied": 0,
+            "scheduled": 0,
+            "sent": 0,
             "public_actions_taken": 0,
             "external_mutations": 0,
+            "approval_status": "not_required_error",
+            "source_refs": [],
+            "thesis": None,
+            "suggested_action": "hold",
+            "candidate_count": 0,
+            "packages_dir": str(state_dir / "gtm-content-packages"),
             "text": (
                 "Torben / GTM Radar\n\n"
                 "Magnus GTM radar refresh failed before it could produce a useful brief.\n"
@@ -219,6 +231,7 @@ def main() -> int:
                 "Nothing has been posted, replied to, scheduled, or sent.\n"
             ),
         }
+    payload.setdefault("packages_dir", str(state_dir / "gtm-content-packages"))
 
     write_gtm_radar_adapter_artifacts(
         payload,
@@ -231,4 +244,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from torben_job_contract import run_job
+
+    raise SystemExit(run_job("torben-gtm-radar", main))

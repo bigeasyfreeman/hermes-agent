@@ -10,6 +10,12 @@ from agent.models_dev import (
 )
 
 
+def _models_dev_module():
+    import agent.models_dev as md
+
+    return md
+
+
 SAMPLE_REGISTRY = {
     "anthropic": {
         "id": "anthropic",
@@ -118,37 +124,37 @@ class TestLookupModelsDevContext:
     @patch("agent.models_dev.fetch_models_dev")
     def test_exact_match(self, mock_fetch):
         mock_fetch.return_value = SAMPLE_REGISTRY
-        assert lookup_models_dev_context("anthropic", "claude-opus-4-6") == 1000000
+        assert _models_dev_module().lookup_models_dev_context("anthropic", "claude-opus-4-6") == 1000000
 
     @patch("agent.models_dev.fetch_models_dev")
     def test_case_insensitive_match(self, mock_fetch):
         mock_fetch.return_value = SAMPLE_REGISTRY
-        assert lookup_models_dev_context("anthropic", "Claude-Opus-4-6") == 1000000
+        assert _models_dev_module().lookup_models_dev_context("anthropic", "Claude-Opus-4-6") == 1000000
 
     @patch("agent.models_dev.fetch_models_dev")
     def test_provider_not_mapped(self, mock_fetch):
         mock_fetch.return_value = SAMPLE_REGISTRY
-        assert lookup_models_dev_context("nous", "some-model") is None
+        assert _models_dev_module().lookup_models_dev_context("nous", "some-model") is None
 
     @patch("agent.models_dev.fetch_models_dev")
     def test_model_not_found(self, mock_fetch):
         mock_fetch.return_value = SAMPLE_REGISTRY
-        assert lookup_models_dev_context("anthropic", "nonexistent-model") is None
+        assert _models_dev_module().lookup_models_dev_context("anthropic", "nonexistent-model") is None
 
     @patch("agent.models_dev.fetch_models_dev")
     def test_provider_aware_context(self, mock_fetch):
         """Same model, different context per provider."""
         mock_fetch.return_value = SAMPLE_REGISTRY
         # Anthropic direct: 1M
-        assert lookup_models_dev_context("anthropic", "claude-opus-4-6") == 1000000
+        assert _models_dev_module().lookup_models_dev_context("anthropic", "claude-opus-4-6") == 1000000
         # GitHub Copilot: only 128K for same model
-        assert lookup_models_dev_context("copilot", "claude-opus-4.6") == 128000
+        assert _models_dev_module().lookup_models_dev_context("copilot", "claude-opus-4.6") == 128000
 
     @patch("agent.models_dev.fetch_models_dev")
     def test_xai_oauth_resolves_xai_context(self, mock_fetch):
         """xAI OAuth is an auth path, not a separate model catalog."""
         mock_fetch.return_value = SAMPLE_REGISTRY
-        assert lookup_models_dev_context("xai-oauth", "grok-build-0.1") == 256000
+        assert _models_dev_module().lookup_models_dev_context("xai-oauth", "grok-build-0.1") == 256000
 
     @patch("agent.models_dev.fetch_models_dev")
     def test_zero_context_filtered(self, mock_fetch):
@@ -160,7 +166,7 @@ class TestLookupModelsDevContext:
     @patch("agent.models_dev.fetch_models_dev")
     def test_empty_registry(self, mock_fetch):
         mock_fetch.return_value = {}
-        assert lookup_models_dev_context("anthropic", "claude-opus-4-6") is None
+        assert _models_dev_module().lookup_models_dev_context("anthropic", "claude-opus-4-6") is None
 
 
 class TestFetchModelsDev:
@@ -178,7 +184,7 @@ class TestFetchModelsDev:
         md._models_dev_cache_time = 0
 
         with patch.object(md, "_save_disk_cache"):
-            result = fetch_models_dev(force_refresh=True)
+            result = _models_dev_module().fetch_models_dev(force_refresh=True)
 
         assert "anthropic" in result
         assert len(result) == len(SAMPLE_REGISTRY)
@@ -192,7 +198,7 @@ class TestFetchModelsDev:
         md._models_dev_cache_time = 0  # expired
 
         with patch.object(md, "_load_disk_cache", return_value=SAMPLE_REGISTRY):
-            result = fetch_models_dev(force_refresh=True)
+            result = _models_dev_module().fetch_models_dev(force_refresh=True)
 
         assert "anthropic" in result
 
@@ -203,7 +209,7 @@ class TestFetchModelsDev:
         md._models_dev_cache = SAMPLE_REGISTRY
         md._models_dev_cache_time = time.time()  # fresh
 
-        result = fetch_models_dev()
+        result = _models_dev_module().fetch_models_dev()
         mock_get.assert_not_called()
         assert result == SAMPLE_REGISTRY
 
@@ -224,7 +230,7 @@ class TestFetchModelsDev:
 
         with patch.object(md, "_disk_cache_age_seconds", return_value=60.0), \
              patch.object(md, "_load_disk_cache", return_value=SAMPLE_REGISTRY):
-            result = fetch_models_dev()
+            result = _models_dev_module().fetch_models_dev()
 
         # The whole point: no network call.
         mock_get.assert_not_called()
@@ -252,7 +258,7 @@ class TestFetchModelsDev:
                           return_value=md._MODELS_DEV_CACHE_TTL + 60), \
              patch.object(md, "_load_disk_cache", return_value=SAMPLE_REGISTRY), \
              patch.object(md, "_save_disk_cache"):
-            result = fetch_models_dev()
+            result = _models_dev_module().fetch_models_dev()
 
         mock_get.assert_called_once()
         assert "anthropic" in result
@@ -277,7 +283,7 @@ class TestFetchModelsDev:
         with patch.object(md, "_disk_cache_age_seconds", return_value=60.0), \
              patch.object(md, "_load_disk_cache", return_value=SAMPLE_REGISTRY), \
              patch.object(md, "_save_disk_cache"):
-            result = fetch_models_dev(force_refresh=True)
+            result = _models_dev_module().fetch_models_dev(force_refresh=True)
 
         mock_get.assert_called_once()
         assert "anthropic" in result
@@ -298,7 +304,7 @@ class TestFetchModelsDev:
 
         with patch.object(md, "_disk_cache_age_seconds", return_value=None), \
              patch.object(md, "_save_disk_cache"):
-            result = fetch_models_dev()
+            result = _models_dev_module().fetch_models_dev()
 
         mock_get.assert_called_once()
         assert "anthropic" in result
@@ -354,7 +360,7 @@ class TestGetModelCapabilities:
     def test_vision_from_attachment_flag(self):
         """Models with attachment=True and no modalities should report supports_vision=True."""
         with patch("agent.models_dev.fetch_models_dev", return_value=CAPS_REGISTRY):
-            caps = get_model_capabilities("anthropic", "claude-sonnet-4")
+            caps = _models_dev_module().get_model_capabilities("anthropic", "claude-sonnet-4")
         assert caps is not None
         assert caps.supports_vision is True
 
@@ -362,21 +368,21 @@ class TestGetModelCapabilities:
         """Models with 'image' in modalities.input but attachment=False should
         still report supports_vision=True (the core fix in this PR)."""
         with patch("agent.models_dev.fetch_models_dev", return_value=CAPS_REGISTRY):
-            caps = get_model_capabilities("google", "gemma-4-31b-it")
+            caps = _models_dev_module().get_model_capabilities("google", "gemma-4-31b-it")
         assert caps is not None
         assert caps.supports_vision is True
 
     def test_text_only_modalities_override_stale_attachment_flag(self):
         """Text-only modalities must win over stale attachment=True metadata."""
         with patch("agent.models_dev.fetch_models_dev", return_value=CAPS_REGISTRY):
-            caps = get_model_capabilities("google", "text-only-with-stale-attachment")
+            caps = _models_dev_module().get_model_capabilities("google", "text-only-with-stale-attachment")
         assert caps is not None
         assert caps.supports_vision is False
 
     def test_no_vision_without_attachment_or_modalities(self):
         """Models with neither attachment nor image modality should be non-vision."""
         with patch("agent.models_dev.fetch_models_dev", return_value=CAPS_REGISTRY):
-            caps = get_model_capabilities("google", "gemma-3-1b")
+            caps = _models_dev_module().get_model_capabilities("google", "gemma-3-1b")
         assert caps is not None
         assert caps.supports_vision is False
 
@@ -392,12 +398,12 @@ class TestGetModelCapabilities:
             }},
         }
         with patch("agent.models_dev.fetch_models_dev", return_value=registry):
-            caps = get_model_capabilities("gemini", "weird-model")
+            caps = _models_dev_module().get_model_capabilities("gemini", "weird-model")
         assert caps is not None
         assert caps.supports_vision is False
 
     def test_model_not_found_returns_none(self):
         """Unknown model should return None."""
         with patch("agent.models_dev.fetch_models_dev", return_value=CAPS_REGISTRY):
-            caps = get_model_capabilities("anthropic", "nonexistent-model")
+            caps = _models_dev_module().get_model_capabilities("anthropic", "nonexistent-model")
         assert caps is None

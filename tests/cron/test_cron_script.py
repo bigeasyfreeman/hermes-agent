@@ -157,6 +157,39 @@ class TestRunJobScript:
         assert success is True
         assert output == "ABSENT"
 
+    def test_script_subprocess_env_gets_sane_path_under_launchd(self, cron_env, monkeypatch, tmp_path):
+        """Cron scripts must find local tools even when launchd gives Hermes a minimal PATH."""
+        if os.name == "nt":
+            pytest.skip("POSIX PATH and executable-bit behavior only")
+
+        from cron.scheduler import _run_job_script
+        from tools.environments import local as local_mod
+
+        fake_bin = tmp_path / "homebrew-bin"
+        fake_bin.mkdir()
+        fake_uv = fake_bin / "uv"
+        fake_uv.write_text("#!/bin/sh\necho fake-uv\n", encoding="utf-8")
+        fake_uv.chmod(0o755)
+        monkeypatch.setenv("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        monkeypatch.setattr(local_mod, "_SANE_PATH", f"{fake_bin}:/usr/bin:/bin:/usr/sbin:/sbin")
+        monkeypatch.setattr(local_mod, "_HERMES_BIN_DIR", None)
+
+        script = cron_env / "scripts" / "uv_probe.py"
+        script.write_text(
+            textwrap.dedent(
+                """\
+                import subprocess
+                result = subprocess.run(["uv"], text=True, capture_output=True, check=True)
+                print(result.stdout.strip())
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        success, output = _run_job_script("uv_probe.py")
+        assert success is True
+        assert output == "fake-uv"
+
     def test_script_empty_output(self, cron_env):
         from cron.scheduler import _run_job_script
 

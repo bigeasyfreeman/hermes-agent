@@ -253,3 +253,17 @@ class TestDefaultPlatformWebSearchCoverage:
 
     def test_hermes_api_server_toolset_includes_web_search(self):
         assert "web_search" in resolve_toolset("hermes-api-server")
+
+    def test_hermes_cli_toolset_includes_loopy_tools(self):
+        tools = resolve_toolset("hermes-cli")
+
+        assert "loopy_catalog_search" in tools
+        assert "loopy_validate_loop" in tools
+        assert "loopy_draft_loop" in tools
+
+    def test_coding_toolset_includes_loopy_tools(self):
+        tools = resolve_toolset("coding")
+
+        assert "loopy_catalog_search" in tools
+        assert "loopy_validate_loop" in tools
+        assert "loopy_draft_loop" in tools

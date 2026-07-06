@@ -40,23 +40,35 @@ def main() -> int:
         radar = load_magnus_gtm_radar(radar_path)
         payload = run_gtm_engagement_radar(
             radar,
-            ledger=ActionLedger(state_dir / "torben-action-ledger.json"),
+            ledger=ActionLedger(state_dir / "torben-action-ledger.jsonl"),
             state_path=state_dir / "torben-gtm-engagement-radar-state.json",
             max_topics=_env_int("TORBEN_GTM_ENGAGEMENT_MAX_TOPICS", DEFAULT_MAX_TOPICS),
             max_opportunities=_env_int("TORBEN_GTM_ENGAGEMENT_MAX_OPPORTUNITIES", DEFAULT_MAX_OPPORTUNITIES),
             mark_delivered=not preview,
             stage_actions=not preview,
         )
+        payload.setdefault("packages_dir", str(state_dir / "gtm-content-packages"))
     except Exception as exc:  # noqa: BLE001
         payload = {
             "task": "torben_gtm_engagement_radar",
             "wakeAgent": True,
+            "status": "error",
             "error": {
                 "type": type(exc).__name__,
                 "message": str(exc)[:300],
             },
+            "posted": 0,
+            "replied": 0,
+            "scheduled": 0,
+            "sent": 0,
             "public_actions_taken": 0,
             "external_mutations": 0,
+            "approval_status": "not_required_error",
+            "source_refs": [],
+            "thesis": None,
+            "suggested_action": "hold",
+            "candidate_count": 0,
+            "packages_dir": str(state_dir / "gtm-content-packages"),
             "text": (
                 "Torben / GTM Response Radar\n\n"
                 "Grok/X response-opportunity scan failed before it could produce a useful brief.\n"
@@ -64,6 +76,7 @@ def main() -> int:
                 "Nothing has been posted, replied to publicly, scheduled, or sent.\n"
             ),
         }
+    payload.setdefault("packages_dir", str(state_dir / "gtm-content-packages"))
 
     write_gtm_engagement_artifacts(
         payload,
@@ -76,4 +89,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from torben_job_contract import run_job
+
+    raise SystemExit(run_job("torben-gtm-engagement-radar", main))

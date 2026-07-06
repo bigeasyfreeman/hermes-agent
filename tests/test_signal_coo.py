@@ -1,6 +1,9 @@
 import json
+import importlib.util
 from argparse import Namespace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
 
 import yaml
 
@@ -16,10 +19,12 @@ from hermes_cli.signal_coo.google_auth import (
 )
 from hermes_cli.signal_coo.google_evidence import build_calendar_block_candidates
 from hermes_cli.signal_coo.gtm_radar_adapter import build_torben_gtm_radar_adapter
+from hermes_cli.signal_coo.gtm_public_reply import send_approved_gtm_public_replies
 from hermes_cli.signal_coo.gtm_reply_router import route_gtm_radar_reply
 from hermes_cli.signal_coo import calendar_sync
 from hermes_cli.signal_coo.calendar_sync import calendar_alignment_sync_needs_attention, sync_calendar_alignment_blocks
 from hermes_cli.signal_coo import cli as torben_cli
+from hermes_cli.signal_coo import email_audit
 from hermes_cli.signal_coo.email_audit import (
     build_morning_briefing_candidates,
     classify_email,
@@ -29,9 +34,17 @@ from hermes_cli.signal_coo.email_audit import (
     render_inbox_audit_report,
 )
 from hermes_cli.signal_coo import email_hygiene
-from hermes_cli.signal_coo.email_hygiene import apply_hygiene_action, stage_hygiene_actions
-from hermes_cli.signal_coo.morning_brief import build_morning_brief_scope, render_morning_brief_text
-from hermes_cli.signal_coo.morning_findings import canonical_url, filter_new_findings
+from hermes_cli.signal_coo.email_hygiene import (
+    apply_hygiene_action,
+    build_inbox_filter_recommendations,
+    stage_hygiene_actions,
+)
+from hermes_cli.signal_coo.morning_brief import (
+    build_meeting_signal_packets,
+    build_morning_brief_scope,
+    render_morning_brief_text,
+)
+from hermes_cli.signal_coo.morning_findings import canonical_url, filter_new_findings, record_llm_signal_candidates
 from hermes_cli.signal_coo.meeting_prep import (
     alert_key,
     is_synthetic_busy_block,
@@ -319,6 +332,190 @@ def test_calendar_alignment_sync_creates_private_busy_blocks(monkeypatch, tmp_pa
     assert body["extendedProperties"]["private"]["torben_alignment"] == "true"
 
 
+def test_calendar_alignment_watchdog_is_always_live_mode_a(monkeypatch, tmp_path):
+    script_path = Path(__file__).resolve().parents[1] / "profiles/torben/scripts/torben_calendar_alignment_audit.py"
+    spec = importlib.util.spec_from_file_location("torben_calendar_alignment_audit_test", script_path)
+    assert spec and spec.loader
+    watchdog = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(watchdog)
+
+    home = tmp_path / "torben"
+    (home / "state").mkdir(parents=True)
+    (home / "config").mkdir(parents=True)
+    monkeypatch.setenv("TORBEN_CALENDAR_ALIGNMENT_DRY_RUN", "1")
+    monkeypatch.setenv("TORBEN_CALENDAR_ALIGNMENT_REHEARSE", "1")
+    monkeypatch.setattr(watchdog, "get_hermes_home", lambda: home)
+
+    source_event = {
+        "account_alias": "work",
+        "calendar_summary": "Primary",
+        "summary": "Investor call",
+        "start_at": "2026-06-24T15:00:00Z",
+        "end_at": "2026-06-24T16:00:00Z",
+        "evidence_ids": ["google-calendar:work:primary:event-1"],
+    }
+    candidate = {
+        "source_account": "work",
+        "target_accounts": ["personal"],
+        "summary": "Investor call",
+        "start_at": "2026-06-24T15:00:00Z",
+        "end_at": "2026-06-24T16:00:00Z",
+        "evidence_ids": ["google-calendar:work:primary:event-1"],
+    }
+    calls = {}
+
+    def fake_collect_google_ea_evidence(**kwargs):
+        calls["collect"] = kwargs
+        return {
+            "ea": {
+                "calendar_events": [source_event],
+                "calendar_block_candidates": [candidate],
+            },
+            "source_diagnostics": {"google": {"audit": {}}},
+        }
+
+    def fake_sync_calendar_alignment_blocks(**kwargs):
+        calls["sync"] = kwargs
+        return {
+            "dry_run": kwargs["dry_run"],
+            "created": [{"event_id": "torben-created"}],
+            "deleted": [{"event_id": "torben-deleted"}],
+            "would_create": [],
+            "would_delete": [],
+            "errors": [],
+            "skipped": [],
+            "external_mutations": 2,
+        }
+
+    monkeypatch.setattr(watchdog, "collect_google_ea_evidence", fake_collect_google_ea_evidence)
+    monkeypatch.setattr(watchdog, "sync_calendar_alignment_blocks", fake_sync_calendar_alignment_blocks)
+    monkeypatch.setattr(watchdog, "render_calendar_alignment_audit", lambda payload: "audit\n")
+    monkeypatch.setattr(watchdog, "render_calendar_alignment_sync", lambda payload: "sync\n")
+
+    assert watchdog.main() == 0
+
+    assert calls["collect"]["max_calendar_block_candidates"] is None
+    assert calls["sync"]["dry_run"] is False
+    assert calls["sync"]["cleanup_stale"] is True
+    assert calls["sync"]["candidates"] == [candidate]
+    assert calls["sync"]["source_events"] == [source_event]
+    assert calls["sync"]["cleanup_window_start"].endswith("Z")
+    assert calls["sync"]["cleanup_window_end"].endswith("Z")
+    assert calls["sync"]["max_mutations"] == 20
+
+    audit_rows = (home / "state/torben-calendar-mutation-audit.jsonl").read_text().splitlines()
+    assert len(audit_rows) == 1
+    audit = json.loads(audit_rows[0])
+    assert audit["mode"] == "auto_private_busy_block"
+    assert audit["dry_run"] is False
+    assert audit["created"] == [{"event_id": "torben-created"}]
+    assert audit["deleted"] == [{"event_id": "torben-deleted"}]
+
+
+def test_calendar_alignment_sync_deletes_stale_blocks_when_source_event_deleted(monkeypatch, tmp_path):
+    config = _write_google_accounts_config(tmp_path)
+    deleted = []
+
+    monkeypatch.setattr(calendar_sync, "_read_token", lambda account: "access-token")
+
+    def fake_list(account, token, *, time_min, time_max):
+        if account.alias != "personal":
+            return [], 1
+        return [
+            {
+                "id": "torbenolddeleted",
+                "start": {"dateTime": "2026-06-24T15:00:00Z"},
+                "end": {"dateTime": "2026-06-24T16:00:00Z"},
+                "extendedProperties": {"private": {"torben_alignment": "true"}},
+            }
+        ], 1
+
+    monkeypatch.setattr(calendar_sync, "_google_list_alignment_events", fake_list)
+    monkeypatch.setattr(calendar_sync, "_google_delete_event", lambda account, token, event_id: deleted.append(event_id))
+
+    sync = sync_calendar_alignment_blocks(
+        config_path=config,
+        candidates=[],
+        source_events=[],
+        cleanup_stale=True,
+        cleanup_window_start="2026-06-24T00:00:00Z",
+        cleanup_window_end="2026-06-25T00:00:00Z",
+    )
+
+    assert deleted == ["torbenolddeleted"]
+    assert sync["deleted"][0]["event_id"] == "torbenolddeleted"
+    assert sync["external_mutations"] == 1
+    assert sync["google_read_api_calls"] == 2
+    assert sync["google_write_api_calls"] == 1
+
+
+def test_calendar_alignment_sync_reconciles_moved_event_without_deleting_current_block(monkeypatch, tmp_path):
+    config = _write_google_accounts_config(tmp_path)
+    inserted = []
+    deleted = []
+    candidate = {
+        "source_account": "work",
+        "target_accounts": ["personal"],
+        "summary": "Investor call moved",
+        "start_at": "2026-06-24T16:00:00Z",
+        "end_at": "2026-06-24T17:00:00Z",
+        "evidence_ids": ["google-calendar:work:primary:event-1"],
+    }
+    current_event_id = calendar_sync._alignment_event_id(candidate, "personal")
+
+    monkeypatch.setattr(calendar_sync, "_read_token", lambda account: "access-token")
+    monkeypatch.setattr(
+        calendar_sync,
+        "_google_insert_event",
+        lambda account, token, event_body: inserted.append(event_body["id"]) or {"htmlLink": "x"},
+    )
+
+    def fake_list(account, token, *, time_min, time_max):
+        if account.alias != "personal":
+            return [], 1
+        return [
+            {
+                "id": "torbenoldmoved",
+                "start": {"dateTime": "2026-06-24T15:00:00Z"},
+                "end": {"dateTime": "2026-06-24T16:00:00Z"},
+                "extendedProperties": {"private": {"torben_alignment": "true"}},
+            },
+            {
+                "id": current_event_id,
+                "start": {"dateTime": "2026-06-24T16:00:00Z"},
+                "end": {"dateTime": "2026-06-24T17:00:00Z"},
+                "extendedProperties": {"private": {"torben_alignment": "true"}},
+            },
+        ], 1
+
+    monkeypatch.setattr(calendar_sync, "_google_list_alignment_events", fake_list)
+    monkeypatch.setattr(calendar_sync, "_google_delete_event", lambda account, token, event_id: deleted.append(event_id))
+
+    sync = sync_calendar_alignment_blocks(
+        config_path=config,
+        candidates=[candidate],
+        source_events=[
+            {
+                "account_alias": "work",
+                "calendar_summary": "Primary",
+                "summary": "Investor call moved",
+                "start_at": "2026-06-24T16:00:00Z",
+                "end_at": "2026-06-24T17:00:00Z",
+                "evidence_ids": ["google-calendar:work:primary:event-1"],
+            }
+        ],
+        cleanup_stale=True,
+        cleanup_window_start="2026-06-24T00:00:00Z",
+        cleanup_window_end="2026-06-25T00:00:00Z",
+    )
+
+    assert inserted == [current_event_id]
+    assert deleted == ["torbenoldmoved"]
+    assert sync["created"][0]["event_id"] == current_event_id
+    assert sync["deleted"][0]["event_id"] == "torbenoldmoved"
+    assert sync["external_mutations"] == 2
+
+
 def test_calendar_alignment_success_does_not_need_signal_attention():
     assert (
         calendar_alignment_sync_needs_attention(
@@ -346,6 +543,7 @@ def test_calendar_alignment_errors_or_caps_need_signal_attention():
         is True
     )
     assert calendar_alignment_sync_needs_attention({"dry_run": True, "would_create": [{"event_id": "x"}]}) is True
+    assert calendar_alignment_sync_needs_attention({"dry_run": True, "would_delete": [{"event_id": "x"}]}) is True
 
 
 def test_meeting_prep_selects_upcoming_real_meeting_and_skips_synthetic_busy():
@@ -468,6 +666,64 @@ def test_morning_brief_scope_renders_six_reads():
     assert "World:" in text
     assert "Move:" in text
     assert "Kim funding call" in text
+
+
+def test_torben_morning_brief_loads_signal_rubric_and_contract(tmp_path):
+    script_path = Path(__file__).resolve().parents[1] / "profiles/torben/scripts/torben_morning_brief.py"
+    spec = importlib.util.spec_from_file_location("torben_morning_brief_test", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    rubric_path = tmp_path / "morning_brief_signal_rubric.md"
+    rubric_path.write_text("Surface fewer sharper items. The LLM judges final signal.\n", encoding="utf-8")
+
+    rubric = module.load_signal_rubric(rubric_path)
+    contract = module.build_llm_signal_judge_contract(rubric)
+
+    assert rubric["missing"] is False
+    assert len(rubric["sha256"]) == 64
+    assert "LLM judges final signal" in rubric["content"]
+    assert contract["rubric_sha256"] == rubric["sha256"]
+    assert "calendar.meeting_signal_packets" in contract["input_surfaces"]
+    assert any("scripts do not assign final relevance scores" in contract["purpose"] for _ in [0])
+
+
+def test_meeting_signal_packet_keeps_unknowns_and_company_hint_for_intro_call():
+    now = datetime(2026, 6, 24, 12, 0, tzinfo=timezone.utc)
+    event = {
+        "summary": "Eric <> Arman",
+        "start_at": datetime(2026, 6, 24, 13, 0, tzinfo=timezone.utc).isoformat(),
+        "end_at": datetime(2026, 6, 24, 13, 30, tzinfo=timezone.utc).isoformat(),
+        "account_email": "eric@example.com",
+        "last_conversation": "calendar context only; no prior conversation captured",
+        "attendees": [
+            {"email": "eric@example.com", "display_name": "Eric Freeman"},
+            {"email": "arman@founderco.ai", "display_name": "Arman"},
+        ],
+        "evidence_ids": ["calendar:arman"],
+    }
+    context = {
+        "people": [],
+        "source_rules": {
+            "founderco.ai": {
+                "description": "AI infrastructure company; verify current context before stating more."
+            }
+        },
+    }
+
+    packets = build_meeting_signal_packets([event], relationship_context=context, now=now)
+
+    assert len(packets) == 1
+    packet = packets[0]
+    assert packet["summary"] == "Eric <> Arman"
+    assert packet["attendees"][0]["email"] == "arman@founderco.ai"
+    assert packet["domains"] == ["founderco.ai"]
+    assert "founderco.ai: AI infrastructure company" in packet["company_context_hint"]
+    assert "invite agenda" in packet["unknowns"]
+    assert "prior conversation summary" in packet["unknowns"]
+    assert packet["suggested_question"] == "What would make this worth continuing, and what would block it?"
+    assert packet["confidence"] == "medium"
 
 
 def test_email_audit_classifies_newsletter_with_useful_links():
@@ -899,6 +1155,157 @@ def test_morning_briefing_candidates_follow_user_examples():
     assert "staged_email_drafts" in candidates["llm_decision_contract"]["output_schema"]
 
 
+def test_newsletter_enrichment_extracts_synopsis_tools_and_concepts():
+    records = [
+        {
+            "account_alias": "personal",
+            "sender": "CloudSecList <info@cloudseclist.com>",
+            "sender_email": "info@cloudseclist.com",
+            "sender_domain": "cloudseclist.com",
+            "subject": "[The CloudSecList] Geiger and SAIST",
+            "snippet": "Geiger and SAIST were highlighted in cloud security tooling.",
+            "body_excerpt": (
+                "Geiger maps cloud asset exposure for security teams. "
+                "SAIST applies static analysis of agentic coding workflows so teams can review risky loops."
+            ),
+            "category": "newsletter_security",
+            "juno_bucket": "info",
+            "links": [
+                classify_link("https://github.com/example/geiger", "Geiger repo"),
+                classify_link("https://example.com/saist-agentic-coding", "SAIST static analysis of agentic coding"),
+            ],
+            "evidence_ids": ["gmail:personal:cloudsec-geiger"],
+            "internal_date_ms": "1782350000300",
+        },
+        {
+            "account_alias": "personal",
+            "sender": "TLDR Engineering <daily@tldrnewsletter.com>",
+            "sender_email": "daily@tldrnewsletter.com",
+            "sender_domain": "tldrnewsletter.com",
+            "subject": "Fintech Engineering Handbook and agentic loops",
+            "snippet": "A fintech engineering handbook and agentic loops workflow.",
+            "body_excerpt": "The fintech engineering handbook explains engineering workflow tradeoffs for product teams.",
+            "category": "newsletter_ai_research",
+            "juno_bucket": "info",
+            "links": [classify_link("https://example.com/fintech-engineering-handbook", "Fintech Engineering Handbook")],
+            "evidence_ids": ["gmail:personal:tldr-fintech"],
+            "internal_date_ms": "1782350000301",
+        },
+    ]
+
+    candidates = build_morning_briefing_candidates(records, relationship_context={"people": [], "source_rules": {}})
+    geiger = next(item for item in candidates["tools"] if item["title"] == "Geiger repo")
+    saist_story = next(item for item in candidates["security_stories"] if item["title"] == "[The CloudSecList] Geiger and SAIST")
+    handbook = next(item for item in candidates["security_stories"] if item["title"] == "Fintech Engineering Handbook and agentic loops")
+
+    assert "Geiger maps cloud asset exposure" in geiger["article_synopsis"]
+    assert "Geiger repo" in geiger["named_tools"]
+    assert any("static analysis" in concept for concept in saist_story["key_concepts"])
+    assert "SAIST" in saist_story["named_tools"]
+    assert "fintech engineering handbook" in handbook["key_concepts"]
+    assert handbook["enrichment_source"] == "email_body_and_link_text"
+    assert "score" not in geiger
+
+
+def test_morning_briefing_candidates_promote_repeated_newsletter_stories():
+    daybreak_url = (
+        "https://shad0wmazt3r.github.io/ai-security?"
+        "utm_source=tldrsec.com&utm_medium=newsletter&utm_campaign=tl-dr-sec-334"
+    )
+    records = [
+        {
+            "account_alias": "personal",
+            "sender": "TLDR Sec <dan@tldrnewsletter.com>",
+            "sender_email": "dan@tldrnewsletter.com",
+            "sender_domain": "tldrnewsletter.com",
+            "subject": "TL;DR Sec #334 - OpenAI Daybreak, AI Agents Canaries",
+            "snippet": "OpenAI Daybreak and AI agent canaries.",
+            "body_excerpt": "OpenAI Daybreak shows up in multiple security newsletters.",
+            "category": "newsletter_security",
+            "links": [
+                {
+                    "url": daybreak_url,
+                    "text": "OpenAI Daybreak AI agents canaries",
+                    "kind": "story_article",
+                }
+            ],
+            "evidence_ids": ["gmail:personal:daybreak-tldr"],
+            "internal_date_ms": "1782350000200",
+        },
+        {
+            "account_alias": "personal",
+            "sender": "Security Weekly <weekly@security.example>",
+            "sender_email": "weekly@security.example",
+            "sender_domain": "security.example",
+            "subject": "Security Weekly - Daybreak and package proxy risks",
+            "snippet": "OpenAI Daybreak appeared in another newsletter.",
+            "body_excerpt": "Daybreak, agents, canaries, and package proxy risk.",
+            "category": "newsletter_security",
+            "links": [
+                {
+                    "url": "https://shad0wmazt3r.github.io/ai-security?utm_source=securityweekly",
+                    "text": "OpenAI Daybreak AI agents canaries",
+                    "kind": "story_article",
+                }
+            ],
+            "evidence_ids": ["gmail:personal:daybreak-weekly"],
+            "internal_date_ms": "1782350000201",
+        },
+        {
+            "account_alias": "personal",
+            "sender": "CloudSecList <info@cloudseclist.com>",
+            "sender_email": "info@cloudseclist.com",
+            "sender_domain": "cloudseclist.com",
+            "subject": "CloudSecList - Klue breach and SaaS exposure",
+            "snippet": "Klue breach coverage.",
+            "body_excerpt": "The Klue breach is a vendor security story.",
+            "category": "newsletter_security",
+            "links": [
+                {
+                    "url": "https://cloud.example/klue-breach",
+                    "text": "Klue breach exposes sales intelligence data",
+                    "kind": "story_article",
+                }
+            ],
+            "evidence_ids": ["gmail:personal:klue-cloudsec"],
+            "internal_date_ms": "1782350000202",
+        },
+        {
+            "account_alias": "personal",
+            "sender": "Vulnerable U <news@vulnu.example>",
+            "sender_email": "news@vulnu.example",
+            "sender_domain": "vulnu.example",
+            "subject": "Vulnerable U - Klue breach follow-up",
+            "snippet": "More Klue breach coverage.",
+            "body_excerpt": "The Klue breach appeared again.",
+            "category": "newsletter_security",
+            "links": [
+                {
+                    "url": "https://vendor.example/articles/klue-breach",
+                    "text": "Klue breach exposes sales intelligence data",
+                    "kind": "story_article",
+                }
+            ],
+            "evidence_ids": ["gmail:personal:klue-vulnu"],
+            "internal_date_ms": "1782350000203",
+        },
+    ]
+
+    candidates = build_morning_briefing_candidates(records)
+    repeated = candidates["repeated_newsletter_stories"]
+    repeated_titles = {item["title"] for item in repeated}
+    daybreak = next(item for item in repeated if item["title"] == "OpenAI Daybreak AI agents canaries")
+    klue = next(item for item in repeated if item["title"] == "Klue breach exposes sales intelligence data")
+
+    assert "OpenAI Daybreak AI agents canaries" in repeated_titles
+    assert "Klue breach exposes sales intelligence data" in repeated_titles
+    assert daybreak["source_count"] == 2
+    assert klue["source_count"] == 2
+    assert daybreak["matched_terms"][0] == "cross_newsletter_repeat"
+    assert candidates["security_stories"][0]["title"] in repeated_titles
+    assert sum(1 for item in candidates["security_stories"] if item["title"] == daybreak["title"]) == 1
+
+
 def test_morning_briefing_candidates_include_priority_sources_and_magellan_relationships():
     cloudsec_link = classify_link("https://example.com/blog/cloudsec/mcp-risk", "MCP cloud security article")
     console_link = classify_link("https://console.dev/tools/agent-observer", "Agent observer tool")
@@ -1200,6 +1607,42 @@ def test_morning_findings_preview_does_not_write_ledger(tmp_path):
     assert not ledger_path.exists()
 
 
+def test_llm_signal_candidate_ledger_records_rubric_hash_without_scores(tmp_path):
+    ledger_path = tmp_path / "llm-signal.json"
+    result = record_llm_signal_candidates(
+        ledger_path=ledger_path,
+        rubric_hash="abc123",
+        stories=[
+            {
+                "title": "Geiger maps cloud exposure",
+                "source": "CloudSecList",
+                "one_sentence": "Potential cloud security tooling signal.",
+                "link": {"url": "https://github.com/example/geiger", "kind": "github_tool"},
+                "evidence_ids": ["gmail:personal:geiger"],
+            }
+        ],
+        tools=[],
+        meeting_packets=[
+            {
+                "summary": "Eric <> Arman",
+                "suggested_question": "What would make this worth continuing?",
+                "evidence_ids": ["calendar:arman"],
+            }
+        ],
+        now=datetime(2026, 6, 25, 12, 0, tzinfo=timezone.utc),
+    )
+
+    payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+    records = list(payload["candidates"].values())
+
+    assert result["candidate_count"] == 2
+    assert payload["rubric_hash"] == "abc123"
+    assert {record["source_kind"] for record in records} == {"story", "meeting"}
+    assert all(record["decision"] == "offered_to_llm" for record in records)
+    assert all(record["rubric_hash"] == "abc123" for record in records)
+    assert not any("score" in record for record in records)
+
+
 def test_boardy_generic_mail_goes_to_digest_not_realtime():
     records = [
         {
@@ -1361,6 +1804,29 @@ def _internal_ms(dt: datetime) -> str:
     return str(int(dt.timestamp() * 1000))
 
 
+def test_email_audit_list_message_ids_supports_whole_inbox_query(monkeypatch):
+    calls = []
+
+    def fake_get(url, token):
+        calls.append(url)
+        return {"messages": [{"id": "msg-1"}]}
+
+    monkeypatch.setattr(email_audit, "_google_get", fake_get)
+
+    message_ids, read_calls, exhausted = email_audit._list_message_ids(
+        "access-token",
+        days=60,
+        max_messages=100,
+        query="in:inbox",
+    )
+
+    assert message_ids == ["msg-1"]
+    assert read_calls == 1
+    assert exhausted is True
+    assert "q=in%3Ainbox" in calls[0]
+    assert "newer_than" not in calls[0]
+
+
 def test_email_hygiene_weekly_review_stages_approval_required_actions(tmp_path):
     now = datetime(2026, 6, 25, 12, 0, tzinfo=timezone.utc)
     ledger = ActionLedger(tmp_path / "actions.json")
@@ -1408,13 +1874,150 @@ def test_email_hygiene_weekly_review_stages_approval_required_actions(tmp_path):
     by_key = {item["key"]: item for item in staged}
     assert set(by_key) == {"trash_mfa_codes", "archive_policy_rewards_noise", "nudge_stale_replies"}
     assert by_key["trash_mfa_codes"]["operation"] == "trash"
-    assert by_key["archive_policy_rewards_noise"]["operation"] == "archive"
+    assert by_key["trash_mfa_codes"]["apply_labels"] == ["Account Security"]
+    assert by_key["archive_policy_rewards_noise"]["operation"] == "trash"
+    assert by_key["archive_policy_rewards_noise"]["apply_labels"] == ["Low Signal Newsletters"]
     assert by_key["nudge_stale_replies"]["operation"] == "nudge_only"
     loaded = ledger.load()
     assert len(loaded) == 3
     assert all(record.status == "approval_required" for record in loaded)
     assert all(record.executor_state["mutation_status"] == "not_applied" for record in loaded)
     assert all("approve_hygiene_apply" in record.allowed_next_actions for record in loaded)
+
+
+def test_email_hygiene_filter_recommendations_find_repeated_inbox_clutter():
+    records = [
+        {
+            "message_id": f"dev-{idx}",
+            "sender": "GitHub <notifications@github.com>",
+            "sender_email": "notifications@github.com",
+            "sender_domain": "github.com",
+            "subject": f"CI run {idx}",
+            "category": "developer_notification_noise",
+            "juno_bucket": "info",
+            "labels": ["INBOX"],
+            "internal_date_ms": str(1782350000000 + idx),
+        }
+        for idx in range(3)
+    ] + [
+        {
+            "message_id": f"customer-{idx}",
+            "sender": "Customer <buyer@example.com>",
+            "sender_email": "buyer@example.com",
+            "sender_domain": "example.com",
+            "subject": f"Can you send the contract {idx}",
+            "category": "founder_funding_customer",
+            "juno_bucket": "reply",
+            "labels": ["INBOX"],
+            "internal_date_ms": str(1782350000100 + idx),
+        }
+        for idx in range(4)
+    ]
+
+    recommendations = build_inbox_filter_recommendations(records)
+
+    assert len(recommendations) == 1
+    assert recommendations[0]["source"] == "notifications@github.com"
+    assert recommendations[0]["recommendation"] == "create_filter_archive_and_label"
+    assert recommendations[0]["criteria"] == {"from": "notifications@github.com"}
+    assert recommendations[0]["suggested_actions"] == ["skip_inbox", "apply_label:Developer Notifications"]
+    assert recommendations[0]["mutation_boundary"] == "recommendation only; no Gmail filter created"
+
+
+def test_email_hygiene_stages_inbox_zero_lifecycle_cleanup(tmp_path):
+    now = datetime(2026, 6, 25, 12, 0, tzinfo=timezone.utc)
+    ledger = ActionLedger(tmp_path / "actions.json")
+    records = [
+        {
+            "account_alias": "personal",
+            "message_id": "newsletter-ai-1",
+            "thread_id": "newsletter-ai-thread",
+            "sender": "AI Security Weekly <weekly@example.com>",
+            "subject": "Agent security links",
+            "snippet": "Useful AI security links for later reading.",
+            "category": "newsletter_ai_research",
+            "juno_bucket": "info",
+            "labels": ["INBOX"],
+            "internal_date_ms": _internal_ms(now - timedelta(days=9)),
+            "evidence_ids": ["gmail:personal:newsletter-ai-1"],
+        },
+        {
+            "account_alias": "personal",
+            "message_id": "dev-1",
+            "thread_id": "dev-thread",
+            "sender": "GitHub <notifications@github.com>",
+            "subject": "Workflow run failed",
+            "snippet": "CI failed on an old branch.",
+            "category": "developer_notification_noise",
+            "juno_bucket": "info",
+            "labels": ["INBOX"],
+            "internal_date_ms": _internal_ms(now - timedelta(days=4)),
+            "evidence_ids": ["gmail:personal:dev-1"],
+        },
+        {
+            "account_alias": "personal",
+            "message_id": "security-notice-1",
+            "thread_id": "security-notice-thread",
+            "sender": "GitHub <noreply@github.com>",
+            "subject": "New sign-in from Chrome",
+            "snippet": "A new sign-in was detected.",
+            "category": "account_security",
+            "juno_bucket": "info",
+            "labels": ["INBOX"],
+            "internal_date_ms": _internal_ms(now - timedelta(days=8)),
+            "evidence_ids": ["gmail:personal:security-notice-1"],
+        },
+        {
+            "account_alias": "personal",
+            "message_id": "resolved-1",
+            "thread_id": "resolved-thread",
+            "sender": "Vendor <billing@example.com>",
+            "subject": "Order delivered",
+            "snippet": "Your order was delivered and the receipt is attached.",
+            "category": "receipt_vendor_ops",
+            "juno_bucket": "info",
+            "labels": ["INBOX"],
+            "internal_date_ms": _internal_ms(now - timedelta(days=8)),
+            "evidence_ids": ["gmail:personal:resolved-1"],
+        },
+        {
+            "account_alias": "work",
+            "message_id": "action-1",
+            "thread_id": "action-thread",
+            "sender": "Customer <customer@example.com>",
+            "subject": "Can you send pricing?",
+            "snippet": "Can you send pricing by Friday?",
+            "category": "founder_funding_customer",
+            "juno_bucket": "reply",
+            "labels": ["INBOX"],
+            "internal_date_ms": _internal_ms(now - timedelta(days=9)),
+            "evidence_ids": ["gmail:work:action-1"],
+        },
+    ]
+
+    staged = stage_hygiene_actions(ledger=ledger, records=records, now=now)
+    by_key = {item["key"]: item for item in staged}
+
+    assert set(by_key) == {
+        "archive_stale_newsletter_signal",
+        "archive_stale_developer_notifications",
+        "archive_stale_account_security_notices",
+        "archive_stale_receipts",
+        "nudge_stale_replies",
+    }
+    assert by_key["archive_stale_newsletter_signal"]["items"][0]["cleanup_status"] == "trash_stale_newsletter_signal"
+    assert by_key["archive_stale_developer_notifications"]["items"][0]["stale_after_hours"] == 72
+    assert by_key["archive_stale_account_security_notices"]["risk_class"] == "medium"
+    assert by_key["archive_stale_receipts"]["items"][0]["content_signals"] == ["delivered", "receipt"]
+    assert by_key["nudge_stale_replies"]["operation"] == "nudge_only"
+    assert by_key["nudge_stale_replies"]["items"][0]["retention_policy"].startswith("keep in inbox")
+    assert by_key["archive_stale_newsletter_signal"]["operation"] == "trash"
+    assert by_key["archive_stale_newsletter_signal"]["apply_labels"] == ["AI Security Newsletters"]
+    assert by_key["archive_stale_developer_notifications"]["apply_labels"] == ["Developer Notifications"]
+    assert by_key["archive_stale_account_security_notices"]["apply_labels"] == ["Account Security"]
+    assert by_key["archive_stale_receipts"]["operation"] == "archive_and_label"
+    assert by_key["archive_stale_receipts"]["apply_labels"] == ["Receipts"]
+    assert all(item["operation"] in {"trash", "archive_and_label", "nudge_only"} for item in staged)
 
 
 def test_email_hygiene_llm_review_filters_cleanup_candidates(monkeypatch, tmp_path):
@@ -1488,6 +2091,169 @@ def test_email_hygiene_llm_review_filters_cleanup_candidates(monkeypatch, tmp_pa
     loaded = ledger.load()
     assert len(loaded) == 1
     assert loaded[0].executor_state["llm_review"]["provider"] == "test-llm"
+
+
+def test_call_hygiene_llm_prefers_auxiliary_client(monkeypatch):
+    """The reviewer must route through the shared auxiliary client.
+
+    Regression for the Codex OAuth backend rejecting plain non-streaming
+    requests.post to /responses with HTTP 400 ("Stream must be set to true").
+    The auxiliary client implements the required streaming transport, so
+    _call_hygiene_llm must use it and never fall back to a raw POST when it is
+    available.
+    """
+
+    group = email_hygiene.HygieneGroup(
+        key="archive_stale_receipts",
+        title="Archive stale receipts",
+        operation="archive_and_label",
+        risk_class="low",
+        rationale="receipts",
+        apply_labels=["Receipts"],
+        items=[{"message_id": "rcpt-1", "category": "receipt_vendor_ops"}],
+    )
+
+    class _Msg:
+        content = '{"recommendations": [{"key": "archive_stale_receipts", "decision": "keep"}]}'
+
+    class _Choice:
+        message = _Msg()
+
+    class _Resp:
+        choices = [_Choice()]
+
+    class _Completions:
+        def create(self, **kwargs):
+            assert kwargs["model"] == "gpt-5.5"
+            return _Resp()
+
+    class _Chat:
+        completions = _Completions()
+
+    class _Client:
+        chat = _Chat()
+
+    import agent.auxiliary_client as aux
+
+    monkeypatch.setattr(aux, "get_text_auxiliary_client", lambda task: (_Client(), "gpt-5.5"))
+    monkeypatch.setattr(aux, "get_auxiliary_extra_body", lambda: None)
+
+    def _boom(*args, **kwargs):  # pragma: no cover - must never be reached
+        raise AssertionError("raw /responses POST must not be used when aux client works")
+
+    monkeypatch.setattr(email_hygiene.requests, "post", _boom)
+
+    generated, meta = email_hygiene._call_hygiene_llm([group])
+
+    assert meta["provider"] == "auxiliary_client"
+    assert meta["model"] == "gpt-5.5"
+    assert generated["recommendations"][0]["key"] == "archive_stale_receipts"
+
+
+
+def test_call_hygiene_llm_honors_explicit_non_codex_provider(monkeypatch):
+    group = email_hygiene.HygieneGroup(
+        key="archive_stale_receipts",
+        title="Archive stale receipts",
+        operation="archive_and_label",
+        risk_class="low",
+        rationale="receipts",
+        apply_labels=["Receipts"],
+        items=[{"message_id": "rcpt-1", "category": "receipt_vendor_ops"}],
+    )
+    monkeypatch.setenv("TORBEN_EMAIL_HYGIENE_LLM_PROVIDER", "xai-oauth")
+    monkeypatch.setenv("TORBEN_EMAIL_HYGIENE_LLM_MODEL", "grok-test")
+
+    import agent.auxiliary_client as aux
+
+    def _aux_boom(task):  # pragma: no cover - must not be reached
+        raise AssertionError("explicit non-Codex provider must use direct provider path")
+
+    monkeypatch.setattr(aux, "get_text_auxiliary_client", _aux_boom)
+
+    import hermes_cli.runtime_provider as runtime_provider
+
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda requested: {
+            "api_key": "test-key",
+            "base_url": "https://api.x.ai/v1",
+            "api_mode": "codex_responses",
+            "model": "ignored-runtime-model",
+        },
+    )
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"output_text": '{"recommendations": [{"key": "archive_stale_receipts", "decision": "keep"}]}' }
+
+    calls = []
+
+    def fake_post(url, headers, json, timeout):
+        calls.append({"url": url, "payload": json, "timeout": timeout})
+        return _Response()
+
+    monkeypatch.setattr(email_hygiene.requests, "post", fake_post)
+
+    generated, meta = email_hygiene._call_hygiene_llm([group])
+
+    assert calls[0]["url"] == "https://api.x.ai/v1/responses"
+    assert calls[0]["payload"]["model"] == "grok-test"
+    assert calls[0]["timeout"] == 30
+    assert meta["provider"] == "xai-oauth"
+    assert generated["recommendations"][0]["decision"] == "keep"
+
+
+def test_email_hygiene_weekly_review_uses_timeout_safe_inbox_collection(monkeypatch, tmp_path, capsys):
+    script_path = Path(__file__).resolve().parents[1] / "profiles/torben/scripts/torben_email_hygiene_review.py"
+    spec = importlib.util.spec_from_file_location("torben_email_hygiene_review_test", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    home = tmp_path / "torben"
+    (home / "config").mkdir(parents=True)
+    (home / "state").mkdir(parents=True)
+    monkeypatch.setattr(module, "get_hermes_home", lambda: home)
+    for key in (
+        "TORBEN_EMAIL_HYGIENE_QUERY",
+        "TORBEN_EMAIL_HYGIENE_MAX_MESSAGES",
+        "TORBEN_EMAIL_HYGIENE_MAX_BODY_FETCHES",
+        "TORBEN_EMAIL_HYGIENE_WORKERS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    calls = {}
+
+    def fake_collect(**kwargs):
+        calls["collect"] = kwargs
+        return {
+            "email_audit": {"messages": [], "message_count": 0},
+            "source_diagnostics": {"gmail": {"audit": {"gmail_read_api_calls": 0, "gmail_write_api_calls": 0, "external_mutations": 0}}},
+        }
+
+    def fake_stage(**kwargs):
+        calls["stage"] = kwargs
+        kwargs["review_metadata_out"].update({"invoked": False, "status": "no_candidates"})
+        return []
+
+    monkeypatch.setattr(module, "collect_gmail_inbox_audit", fake_collect)
+    monkeypatch.setattr(module, "stage_hygiene_actions", fake_stage)
+
+    assert module.main() == 0
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["wakeAgent"] is False
+    assert calls["collect"]["gmail_query"] == "in:inbox newer_than:60d"
+    assert calls["collect"]["max_messages_per_account"] == 750
+    assert calls["collect"]["max_body_fetches_per_account"] == 100
+    assert calls["stage"]["enable_llm_review"] is True
+    latest = json.loads((home / "state/torben-email-hygiene-review-actions-latest.json").read_text())
+    assert latest["diagnostics"]["collection_settings"]["gmail_query"] == "in:inbox newer_than:60d"
 
 
 def test_email_hygiene_apply_can_trash_existing_spam(monkeypatch, tmp_path):
@@ -1608,6 +2374,415 @@ def test_email_hygiene_apply_archives_only_after_handle_approval(monkeypatch, tm
     assert updated is not None
     assert updated.status == "executed"
     assert updated.executor_state["mutation_status"] == "applied"
+    audit_path = tmp_path / "state" / "torben-email-hygiene-audit.jsonl"
+    assert audit_path.exists()
+    audit = json.loads(audit_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert audit["handle"] == action.handle
+    assert audit["operation"] == "archive"
+    assert audit["external_mutations"] == 1
+    assert audit["policy_decision"]["action"] == "email_archive_delete_label"
+
+
+def test_email_hygiene_apply_can_label_message_by_safe_label_name(monkeypatch, tmp_path):
+    ledger = ActionLedger(tmp_path / "actions.json")
+    action = ledger.add_action(
+        scope="EA",
+        summary="Label AI newsletters",
+        allowed_next_actions=["approve_hygiene_apply"],
+        status="approval_required",
+        executor_state={
+            "mutation_type": "gmail_hygiene",
+            "provider": "gmail",
+            "operation": "label",
+            "items": [
+                {
+                    "account_alias": "personal",
+                    "message_id": "newsletter-1",
+                    "category": "newsletter_ai_research",
+                    "reason": "label repeated AI/security newsletter source",
+                    "apply_labels": ["AI Security Newsletters"],
+                }
+            ],
+        },
+    )
+    calls = []
+    monkeypatch.setattr(
+        email_hygiene,
+        "account_for_alias",
+        lambda config_path, alias: GoogleAccount(
+            alias=alias,
+            email="personal@example.com",
+            role="personal",
+            enabled=True,
+            token_path=tmp_path / "token.json",
+            client_secret_path=tmp_path / "client.json",
+            scopes=("https://www.googleapis.com/auth/gmail.modify",),
+        ),
+    )
+    monkeypatch.setattr(email_hygiene, "_read_token", lambda account: "access-token")
+    monkeypatch.setattr(email_hygiene, "_gmail_get", lambda url, token: {"labels": []})
+
+    def fake_post(url, token, payload=None):
+        calls.append((url, payload))
+        if url.endswith("/labels"):
+            return {"id": "Label_123"}
+        return {}
+
+    monkeypatch.setattr(email_hygiene, "_gmail_post", fake_post)
+
+    result = apply_hygiene_action(
+        ledger=ledger,
+        config_path=tmp_path / "google_accounts.yaml",
+        handle=action.handle,
+        approved_by="test",
+    )
+
+    assert result["external_mutations"] == 1
+    assert calls == [
+        (
+            "https://gmail.googleapis.com/gmail/v1/users/me/labels",
+            {
+                "name": "AI Security Newsletters",
+                "labelListVisibility": "labelShow",
+                "messageListVisibility": "show",
+            },
+        ),
+        (
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/newsletter-1/modify",
+            {"addLabelIds": ["Label_123"]},
+        ),
+    ]
+
+
+def test_email_hygiene_apply_can_label_then_trash_v3_disposable_noise(monkeypatch, tmp_path):
+    ledger = ActionLedger(tmp_path / "actions.json")
+    action = ledger.add_action(
+        scope="EA",
+        summary="Trash stale low-signal newsletter",
+        allowed_next_actions=["approve_hygiene_apply"],
+        status="approval_required",
+        executor_state={
+            "mutation_type": "gmail_hygiene",
+            "provider": "gmail",
+            "operation": "trash",
+            "apply_labels": ["Low Signal Newsletters"],
+            "items": [
+                {
+                    "account_alias": "personal",
+                    "message_id": "newsletter-1",
+                    "category": "newsletter_general",
+                    "juno_bucket": "info",
+                    "cleanup_status": "trash_low_signal_long_tail",
+                    "reason": "low-signal info mail older than thirty days",
+                }
+            ],
+        },
+    )
+    calls = []
+    monkeypatch.setattr(
+        email_hygiene,
+        "account_for_alias",
+        lambda config_path, alias: GoogleAccount(
+            alias=alias,
+            email="personal@example.com",
+            role="personal",
+            enabled=True,
+            token_path=tmp_path / "token.json",
+            client_secret_path=tmp_path / "client.json",
+            scopes=("https://www.googleapis.com/auth/gmail.modify",),
+        ),
+    )
+    monkeypatch.setattr(email_hygiene, "_read_token", lambda account: "access-token")
+    monkeypatch.setattr(
+        email_hygiene,
+        "_gmail_get",
+        lambda url, token: {"labels": [{"id": "Label_low", "name": "Low Signal Newsletters"}]},
+    )
+    monkeypatch.setattr(email_hygiene, "_gmail_post", lambda url, token, payload=None: calls.append((url, payload)) or {})
+
+    result = apply_hygiene_action(
+        ledger=ledger,
+        config_path=tmp_path / "google_accounts.yaml",
+        handle=action.handle,
+        approved_by="test",
+    )
+
+    assert result["external_mutations"] == 2
+    assert result["gmail_write_api_calls"] == 2
+    assert calls == [
+        (
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/newsletter-1/modify",
+            {"addLabelIds": ["Label_low"]},
+        ),
+        (
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/newsletter-1/trash",
+            None,
+        ),
+    ]
+
+
+def test_email_hygiene_apply_can_archive_and_label_message(monkeypatch, tmp_path):
+    ledger = ActionLedger(tmp_path / "actions.json")
+    action = ledger.add_action(
+        scope="EA",
+        summary="Archive and label receipts",
+        allowed_next_actions=["approve_hygiene_apply"],
+        status="approval_required",
+        executor_state={
+            "mutation_type": "gmail_hygiene",
+            "provider": "gmail",
+            "operation": "archive_and_label",
+            "apply_labels": ["Receipts"],
+            "items": [
+                {
+                    "account_alias": "personal",
+                    "message_id": "receipt-1",
+                    "category": "receipt_vendor_ops",
+                    "reason": "receipt/vendor confirmation older than two weeks",
+                }
+            ],
+        },
+    )
+    calls = []
+    monkeypatch.setattr(
+        email_hygiene,
+        "account_for_alias",
+        lambda config_path, alias: GoogleAccount(
+            alias=alias,
+            email="personal@example.com",
+            role="personal",
+            enabled=True,
+            token_path=tmp_path / "token.json",
+            client_secret_path=tmp_path / "client.json",
+            scopes=("https://www.googleapis.com/auth/gmail.modify",),
+        ),
+    )
+    monkeypatch.setattr(email_hygiene, "_read_token", lambda account: "access-token")
+    monkeypatch.setattr(
+        email_hygiene,
+        "_gmail_get",
+        lambda url, token: {"labels": [{"id": "Label_receipts", "name": "Receipts"}]},
+    )
+    monkeypatch.setattr(email_hygiene, "_gmail_post", lambda url, token, payload=None: calls.append((url, payload)) or {})
+
+    result = apply_hygiene_action(
+        ledger=ledger,
+        config_path=tmp_path / "google_accounts.yaml",
+        handle=action.handle,
+        approved_by="test",
+    )
+
+    assert result["external_mutations"] == 1
+    assert calls == [
+        (
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/receipt-1/modify",
+            {"removeLabelIds": ["INBOX"], "addLabelIds": ["Label_receipts"]},
+        )
+    ]
+
+
+def test_email_hygiene_auto_apply_respects_fail_closed_policy(tmp_path):
+    ledger = ActionLedger(tmp_path / "actions.json")
+    action = ledger.add_action(
+        scope="EA",
+        summary="Auto archive receipts",
+        allowed_next_actions=["approve_hygiene_apply"],
+        status="approval_required",
+        executor_state={
+            "mutation_type": "gmail_hygiene",
+            "provider": "gmail",
+            "operation": "archive",
+            "items": [
+                {
+                    "account_alias": "personal",
+                    "message_id": "receipt-1",
+                    "category": "receipt_vendor_ops",
+                    "reason": "receipt/vendor confirmation older than two weeks",
+                }
+            ],
+        },
+    )
+
+    result = apply_hygiene_action(
+        ledger=ledger,
+        config_path=tmp_path / "config" / "google_accounts.yaml",
+        handle=action.handle,
+        approved_by="auto-hygiene-loop",
+        auto_apply=True,
+    )
+
+    assert result["external_mutations"] == 0
+    assert result["errors"][0]["error"] == "email_archive_delete_label_policy_blocks_auto_apply"
+
+
+def test_email_hygiene_auto_apply_signal_summary_is_compact():
+    script_path = Path(__file__).resolve().parents[1] / "profiles/torben/scripts/torben_email_hygiene_auto_apply.py"
+    spec = importlib.util.spec_from_file_location("torben_email_hygiene_auto_apply_test", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    summary = module.summarize_auto_apply_for_signal(
+        {
+            "selected_handles": ["EA-20260629-002"],
+            "results": [
+                {
+                    "operation": "archive_and_label",
+                    "applied": [
+                        {"message_id": "msg-1", "labels": ["Receipts"]},
+                        {"message_id": "msg-2", "labels": ["Receipts"]},
+                    ],
+                    "skipped": [],
+                    "errors": [],
+                }
+            ],
+            "gmail_write_api_calls": 2,
+            "external_mutations": 2,
+            "dry_run": False,
+            "errors": [],
+        }
+    )
+    dry_run_summary = module.summarize_auto_apply_for_signal(
+        {
+            "selected_handles": ["EA-20260629-003"],
+            "results": [
+                {
+                    "operation": "trash",
+                    "applied": [{"message_id": "dry-run-msg"}],
+                    "skipped": [],
+                    "errors": [],
+                }
+            ],
+            "gmail_write_api_calls": 0,
+            "external_mutations": 0,
+            "dry_run": True,
+            "errors": [],
+        }
+    )
+    silent = module.summarize_auto_apply_for_signal({"results": [], "errors": []})
+
+    assert "EA-20260629-002" in summary
+    assert "Applied: 2 message(s)" in summary
+    assert "archive_and_label" in summary
+    assert "msg-1" not in summary
+    assert '"applied"' not in summary
+    assert "Full audit:" in summary
+    assert "Would apply: 1 message(s) via trash" in dry_run_summary
+    assert "dry-run-msg" not in dry_run_summary
+    assert json.loads(silent)["wakeAgent"] is False
+
+
+def test_email_hygiene_auto_apply_respects_policy_max_per_run(tmp_path):
+    policy = tmp_path / "policy.yaml"
+    policy.write_text(
+        "\n".join(
+            [
+                "ea:",
+                "  mutations:",
+                "    email_archive_delete_label:",
+                "      enabled: true",
+                "      max_per_run: 1",
+                "      approval_mode: explicit_signal_handle",
+                "      audit_log_path: state/torben-email-hygiene-audit.jsonl",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    ledger = ActionLedger(tmp_path / "actions.json")
+    action = ledger.add_action(
+        scope="EA",
+        summary="Auto archive receipts",
+        allowed_next_actions=["approve_hygiene_apply"],
+        status="approval_required",
+        executor_state={
+            "mutation_type": "gmail_hygiene",
+            "provider": "gmail",
+            "operation": "archive",
+            "items": [
+                {
+                    "account_alias": "personal",
+                    "message_id": "receipt-1",
+                    "category": "receipt_vendor_ops",
+                    "reason": "receipt/vendor confirmation older than two weeks",
+                },
+                {
+                    "account_alias": "personal",
+                    "message_id": "receipt-2",
+                    "category": "receipt_vendor_ops",
+                    "reason": "receipt/vendor confirmation older than two weeks",
+                },
+            ],
+        },
+    )
+
+    result = apply_hygiene_action(
+        ledger=ledger,
+        config_path=tmp_path / "config" / "google_accounts.yaml",
+        handle=action.handle,
+        approved_by="auto-hygiene-loop",
+        auto_apply=True,
+        policy_path=policy,
+    )
+
+    assert result["external_mutations"] == 0
+    assert result["errors"][0]["error"] == "email_archive_delete_label_policy_max_per_run_exceeded"
+
+
+def test_email_hygiene_apply_allows_new_inbox_zero_archive_classes(monkeypatch, tmp_path):
+    ledger = ActionLedger(tmp_path / "actions.json")
+    action = ledger.add_action(
+        scope="EA",
+        summary="Archive stale developer notifications",
+        allowed_next_actions=["approve_hygiene_apply"],
+        status="approval_required",
+        executor_state={
+            "mutation_type": "gmail_hygiene",
+            "provider": "gmail",
+            "hygiene_policy_version": 2,
+            "operation": "archive",
+            "items": [
+                {
+                    "account_alias": "personal",
+                    "message_id": "dev-1",
+                    "category": "developer_notification_noise",
+                    "reason": "developer notification older than three days and not action-routed",
+                },
+                {
+                    "account_alias": "personal",
+                    "message_id": "newsletter-1",
+                    "category": "newsletter_ai_research",
+                    "reason": "security/AI newsletter signal older than seven days",
+                },
+            ],
+        },
+    )
+    calls = []
+    monkeypatch.setattr(
+        email_hygiene,
+        "account_for_alias",
+        lambda config_path, alias: GoogleAccount(
+            alias=alias,
+            email="personal@example.com",
+            role="personal",
+            enabled=True,
+            token_path=tmp_path / "token.json",
+            client_secret_path=tmp_path / "client.json",
+            scopes=("https://www.googleapis.com/auth/gmail.modify",),
+        ),
+    )
+    monkeypatch.setattr(email_hygiene, "_read_token", lambda account: "access-token")
+    monkeypatch.setattr(email_hygiene, "_gmail_post", lambda url, token, payload=None: calls.append((url, token, payload)) or {})
+
+    result = apply_hygiene_action(
+        ledger=ledger,
+        config_path=tmp_path / "google_accounts.yaml",
+        handle=action.handle,
+        approved_by="test",
+    )
+
+    assert result["external_mutations"] == 2
+    assert [call[0].rsplit("/", 2)[-2] for call in calls] == ["dev-1", "newsletter-1"]
 
 
 def test_email_hygiene_apply_refuses_to_trash_non_account_security(tmp_path):
@@ -1644,6 +2819,42 @@ def test_email_hygiene_apply_refuses_to_trash_non_account_security(tmp_path):
     assert result["external_mutations"] == 0
     assert result["errors"]
     assert "Refusing to trash item outside approved stale-code/spam classes" in result["errors"][0]["error"]
+
+
+def test_email_hygiene_apply_refuses_to_archive_actionable_mail(tmp_path):
+    ledger = ActionLedger(tmp_path / "actions.json")
+    action = ledger.add_action(
+        scope="EA",
+        summary="Bad archive action",
+        allowed_next_actions=["approve_hygiene_apply"],
+        status="approval_required",
+        executor_state={
+            "mutation_type": "gmail_hygiene",
+            "provider": "gmail",
+            "hygiene_policy_version": 2,
+            "operation": "archive",
+            "items": [
+                {
+                    "account_alias": "work",
+                    "message_id": "customer-1",
+                    "category": "founder_funding_customer",
+                    "reason": "action-shaped thread older than one week",
+                }
+            ],
+        },
+    )
+
+    result = apply_hygiene_action(
+        ledger=ledger,
+        config_path=tmp_path / "google_accounts.yaml",
+        handle=action.handle,
+        approved_by="test",
+        dry_run=True,
+    )
+
+    assert result["external_mutations"] == 0
+    assert result["errors"]
+    assert "Refusing to archive actionable category founder_funding_customer" in result["errors"][0]["error"]
 
 
 def test_torben_resolve_reply_applies_hygiene_after_explicit_approval(monkeypatch, tmp_path, capsys):
@@ -2119,6 +3330,20 @@ def test_gtm_radar_adapter_stages_signal_actions_and_dedupes(tmp_path):
 
     assert first["wakeAgent"] is True
     assert first["selected_count"] == 2
+    assert first["status"] == "staged"
+    assert first["posted"] == 0
+    assert first["replied"] == 0
+    assert first["scheduled"] == 0
+    assert first["sent"] == 0
+    assert first["approval_status"] == "approval_required"
+    assert first["suggested_action"] == "draft_content"
+    assert first["source_refs"] == [
+        "gtm-1",
+        "https://arxiv.org/abs/2606.24402",
+        "gtm-2",
+        "https://arxiv.org/abs/2606.24937",
+    ]
+    assert first["thesis"] == "AI security is becoming a runtime control-plane problem."
     assert "Torben / GTM Radar" in first["text"]
     assert "LLM judge: Grok ran (grok-test); x_search_used=true; status=accepted." in first["text"]
     assert "X algorithm lens" in first["text"]
@@ -2128,6 +3353,11 @@ def test_gtm_radar_adapter_stages_signal_actions_and_dedupes(tmp_path):
     assert first["cron_audit"]["llm_invoked"] is True
     assert second["wakeAgent"] is False
     assert second["text"] == ""
+    assert second["posted"] == 0
+    assert second["replied"] == 0
+    assert second["scheduled"] == 0
+    assert second["sent"] == 0
+    assert second["approval_status"] == "not_required_no_action"
     actions = ledger.load()
     assert [action.handle for action in actions] == ["GTM-20260625-001", "GTM-20260625-002"]
     assert actions[0].executor_state["mutation_status"] == "draft_only"
@@ -2350,6 +3580,160 @@ def test_gtm_radar_reply_router_handles_rank_alias_without_quote_handles(tmp_pat
     assert records["GTM-20260625-001"].status == "staged"
     assert records["GTM-20260625-002"].status == "executed"
     assert records["GTM-20260625-003"].executor_state["referenced_handles"] == ["GTM-20260625-002"]
+
+
+def _stage_gtm_public_reply_action(ledger, *, status="staged", now=None):
+    now = now or datetime(2026, 6, 26, 12, 0, tzinfo=timezone.utc)
+    return ledger.add_action(
+        scope="GTM",
+        summary="Review X reply opportunity 1: @example",
+        allowed_next_actions=["revise_reply_draft", "show_source", "hold"],
+        status=status,
+        now=now,
+        executor_state={
+            "mutation_type": "social_reply_draft",
+            "mutation_status": "draft_only",
+            "source": "torben_gtm_engagement_radar",
+            "post_url": "https://x.com/example/status/1234567890",
+            "draft_reply": "Operator control planes need receipts, not vibes.",
+        },
+    )
+
+
+def test_gtm_public_reply_approval_dry_run_does_not_mutate_ledger(tmp_path):
+    ledger = ActionLedger(tmp_path / "actions.json")
+    action = _stage_gtm_public_reply_action(ledger)
+    calls = []
+
+    def fake_runner(command, cwd):
+        calls.append({"command": command, "cwd": cwd})
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"public_actions_taken": 0, "target_tweet_id": "1234567890"}),
+            stderr="",
+        )
+
+    result = send_approved_gtm_public_replies(
+        ledger=ledger,
+        reply_text=f"I approve {action.handle}",
+        dry_run=True,
+        yes=False,
+        magnus_root=tmp_path / "magnus",
+        runner=fake_runner,
+    )
+
+    assert result.handled is True
+    assert result.status == "dry_run"
+    assert result.results[0]["status"] == "dry_run"
+    assert result.to_dict()["public_actions_taken"] == 0
+    assert calls
+    command = calls[0]["command"]
+    assert command[0].endswith("/uv") or command[0] == "uv"
+    assert command[1:3] == ["run", "python"]
+    assert command[3] == "scripts/x_post_reply.py"
+    assert "--attempt-unsummoned" in command
+    assert "--yes" not in command
+    assert "--approval-artifact" not in command
+    assert ledger.get(action.handle).status == "staged"
+    assert not (tmp_path / "gtm-public-replies").exists()
+
+
+def test_gtm_public_reply_resolves_uv_from_explicit_binary(monkeypatch, tmp_path):
+    from hermes_cli.signal_coo import gtm_public_reply
+
+    uv = tmp_path / "uv"
+    uv.write_text("#!/bin/sh\n", encoding="utf-8")
+    uv.chmod(0o755)
+    monkeypatch.setenv("HERMES_UV_BINARY", str(uv))
+
+    assert gtm_public_reply._resolve_uv_binary() == str(uv)
+
+
+def test_gtm_public_reply_approval_sends_and_marks_record(tmp_path):
+    ledger = ActionLedger(tmp_path / "actions.json")
+    now = datetime(2026, 6, 26, 12, 0, tzinfo=timezone.utc)
+    action = _stage_gtm_public_reply_action(ledger, now=now)
+    calls = []
+
+    def fake_runner(command, cwd):
+        calls.append({"command": command, "cwd": cwd})
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "public_actions_taken": 1,
+                    "posted_tweet_id": "999",
+                    "posted_url": "https://x.com/eric/status/999",
+                }
+            ),
+            stderr="",
+        )
+
+    result = send_approved_gtm_public_replies(
+        ledger=ledger,
+        reply_text=f"send {action.handle}",
+        approved_by="signal:+15551234567",
+        dry_run=False,
+        yes=True,
+        magnus_root=tmp_path / "magnus",
+        now=now + timedelta(minutes=1),
+        runner=fake_runner,
+    )
+
+    assert result.handled is True
+    assert result.status == "sent"
+    assert result.to_dict()["public_actions_taken"] == 1
+    command = calls[0]["command"]
+    assert "--yes" in command
+    approval_index = command.index("--approval-artifact") + 1
+    approval_path = command[approval_index]
+    approval = json.loads(open(approval_path, encoding="utf-8").read())
+    assert approval["platform"] == "x"
+    assert approval["action"] == "reply"
+    assert approval["target"] == "1234567890"
+    assert approval["exact_copy"] == "Operator control planes need receipts, not vibes."
+    assert approval["torben_handle"] == action.handle
+    assert approval["guard"] == "torben_gtm_approved_handle_v1"
+
+    saved = ledger.get(action.handle)
+    assert saved.status == "executed"
+    assert saved.allowed_next_actions == ["delete_public_reply"]
+    assert saved.executor_state["mutation_status"] == "public_reply_sent"
+    assert saved.executor_state["posted_tweet_id"] == "999"
+    assert saved.executor_state["posted_url"] == "https://x.com/eric/status/999"
+    assert saved.executor_state["public_actions_taken"] == 1
+    assert saved.executor_state["external_mutations"] == 1
+    assert saved.executor_state["x_write_guard"] == "torben_gtm_approved_handle_v1"
+    assert saved.resolution_history[-1]["status"] == "public_reply_sent"
+
+
+def test_gtm_public_reply_approval_ignores_non_social_reply_gtm_handles(tmp_path):
+    ledger = ActionLedger(tmp_path / "actions.json")
+    action = ledger.add_action(
+        scope="GTM",
+        summary="Draft GTM content package",
+        status="approval_required",
+        now=datetime(2026, 6, 26, 12, 0, tzinfo=timezone.utc),
+        executor_state={
+            "mutation_type": "social_content_package",
+            "mutation_status": "approval_ready_draft_package",
+            "source": "torben_gtm_reply_router",
+        },
+    )
+
+    result = send_approved_gtm_public_replies(
+        ledger=ledger,
+        reply_text=f"approve {action.handle}",
+        dry_run=False,
+        yes=True,
+        magnus_root=tmp_path / "magnus",
+        runner=lambda command, cwd: (_ for _ in ()).throw(AssertionError("runner should not be called")),
+    )
+
+    assert result.handled is False
+    assert result.status == "no_public_reply_targets"
+    assert result.results[0]["error_code"] == "not_public_reply_draft"
+    assert ledger.get(action.handle).status == "approval_required"
 
 
 def test_gtm_grok_writer_calls_xai_responses_with_x_search(monkeypatch):
@@ -2583,6 +3967,104 @@ def test_torben_cli_operating_brief_and_scopes(tmp_path, capsys):
     scopes_payload = json.loads(capsys.readouterr().out)
     assert scopes_payload["operator"]["name"] == "Torben"
     assert [scope["scope"] for scope in scopes_payload["scopes"]] == ["ea", "gtm", "finance"]
+
+
+def _write_ladder_config(tmp_path):
+    config = tmp_path / "torben-autonomy-ladder.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "schema": "torben.autonomy-ladder-config.v1",
+                "state_path": str(tmp_path / "torben-autonomy-ladder.json"),
+                "event_log_path": str(tmp_path / "torben-autonomy-ladder-events.jsonl"),
+                "categories": {
+                    "gmail_archive": {
+                        "initial_rung": "packet_only",
+                        "N_clean_required": 10,
+                        "max_per_run": 1,
+                        "max_per_day": 3,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return config
+
+
+def test_torben_resolve_reply_promotes_only_from_eric_signal_sender(tmp_path, capsys):
+    config = _write_ladder_config(tmp_path)
+
+    exit_code = torben_command(
+        Namespace(
+            torben_action="resolve-reply",
+            reply=["promote", "gmail_archive"],
+            ledger=str(tmp_path / "actions.json"),
+            sender="+1 (516) 384-3337",
+            ladder_config=str(config),
+            json=True,
+        )
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "promoted"
+    assert payload["promotion"]["category"] == "gmail_archive"
+    assert payload["promotion"]["actor"] == "+15163843337"
+    assert payload["promotion"]["from_rung"] == "packet_only"
+    assert payload["promotion"]["to_rung"] == "approve_each"
+
+    state = json.loads((tmp_path / "torben-autonomy-ladder.json").read_text(encoding="utf-8"))
+    assert state["categories"]["gmail_archive"]["rung"] == "approve_each"
+    event = json.loads((tmp_path / "torben-autonomy-ladder-events.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert event["event"] == "promotion"
+    assert event["from_rung"] == "packet_only"
+    assert event["to_rung"] == "approve_each"
+
+
+def test_torben_resolve_reply_rejects_promotion_from_other_sender(tmp_path, capsys):
+    config = _write_ladder_config(tmp_path)
+
+    exit_code = torben_command(
+        Namespace(
+            torben_action="resolve-reply",
+            reply=["promote", "gmail_archive"],
+            ledger=str(tmp_path / "actions.json"),
+            sender="+15551234567",
+            ladder_config=str(config),
+            json=True,
+        )
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "rejected"
+    assert payload["promotion"]["reason"] == "promotion_requires_eric_signal_sender"
+    assert not (tmp_path / "torben-autonomy-ladder.json").exists()
+    event = json.loads((tmp_path / "torben-autonomy-ladder-events.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert event["event"] == "promotion_rejected"
+    assert event["sender"] == "+15551234567"
+
+
+def test_torben_resolve_reply_does_not_infer_promotion(tmp_path, capsys):
+    config = _write_ladder_config(tmp_path)
+
+    exit_code = torben_command(
+        Namespace(
+            torben_action="resolve-reply",
+            reply=["gmail_archive", "looks", "eligible"],
+            ledger=str(tmp_path / "actions.json"),
+            sender="+15163843337",
+            ladder_config=str(config),
+            json=True,
+        )
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "not_found"
+    assert not (tmp_path / "torben-autonomy-ladder.json").exists()
+    assert not (tmp_path / "torben-autonomy-ladder-events.jsonl").exists()
 
 
 def test_torben_cli_auth_check_reports_oauth_mcp_native_policy(tmp_path, monkeypatch, capsys):

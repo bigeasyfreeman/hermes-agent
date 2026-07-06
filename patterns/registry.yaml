@@ -1,0 +1,34 @@
+version: 1
+owner: torben
+default_level: L1
+patterns:
+  - id: rtk-infra-loop
+    level: L1
+    artifact: LOOP.md
+    verifier: rtk-output-infra-check
+    mutation_policy: local_config_only
+  - id: safe-skill-factory-loop
+    level: L1
+    artifact: ~/.hermes/skill-factory/staged
+    verifier: skill-factory-review-gate
+    mutation_policy: staged_then_confirmed_skill_md_only
+  - id: torben-finance-loop
+    level: L2
+    artifact: ~/.hermes/profiles/torben/state/torben-finance-radar-latest.json
+    verifier: torben-production-verifier
+    mutation_policy: stage_only_zero_broker_orders
+  - id: torben-gtm-loop
+    level: L2
+    artifact: ~/.hermes/profiles/torben/state/torben-gtm-radar-latest.json
+    verifier: gtm-loop-verifier
+    mutation_policy: no_public_mutation_without_approval
+  - id: torben-ea-loop
+    level: L2
+    artifact: ~/.hermes/profiles/torben/state/ea-loop-latest.json
+    verifier: ea-loop-verifier
+    mutation_policy: no_email_or_calendar_mutation_without_approval
+  - id: torben-loopy-memory-loop
+    level: L1
+    artifact: ~/.hermes/profiles/torben/memories/MEMORY.md
+    verifier: loopy-memory-weekly-review
+    mutation_policy: profile_memory_only_no_secrets_mark_before_delete

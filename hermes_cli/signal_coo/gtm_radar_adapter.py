@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .action_ledger import ActionLedger, ActionRecord
+from .automation_policy import gtm_automation_decision, load_torben_automation_policy
 from .gtm_x_algorithm import x_algorithm_brief_line, x_algorithm_signal_lens
 
 
@@ -26,6 +27,15 @@ ROUTE_LABELS = {
     "linkedin_or_x_post": "LinkedIn/X post",
     "monitor": "monitor",
     "learn": "learning note",
+}
+
+ZERO_PUBLIC_MUTATION_FIELDS = {
+    "posted": 0,
+    "replied": 0,
+    "scheduled": 0,
+    "sent": 0,
+    "public_actions_taken": 0,
+    "external_mutations": 0,
 }
 
 ARTICLE_CREATION_CONTRACT = {
@@ -60,10 +70,34 @@ def build_torben_gtm_radar_adapter(
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     state_file = Path(state_path)
     state = _load_state(state_file)
+    policy = load_torben_automation_policy()
+    cooldown_minutes = _positive_int(
+        os.getenv("TORBEN_GTM_RADAR_DELIVERY_COOLDOWN_MINUTES"),
+        _positive_int(((policy.get("gtm") or {}).get("delivery_cooldown_minutes")), 45),
+    )
     delivered = state.get("delivered_findings") if isinstance(state.get("delivered_findings"), dict) else {}
     findings = [item for item in radar.get("findings", []) if isinstance(item, dict)]
     unseen = [item for item in findings if _finding_key(item) not in delivered]
     selected = unseen[: max(0, max_items)]
+    if selected and mark_delivered and stage_actions and not _cooldown_elapsed(state, now=now, cooldown_minutes=cooldown_minutes):
+        payload = {
+            "task": "torben_gtm_radar_adapter",
+            "wakeAgent": False,
+            "generated_at": now.isoformat().replace("+00:00", "Z"),
+            "reason": "gtm_radar_delivery_cooldown_active",
+            "radar_generated_at": radar.get("generated_at"),
+            "scanned_count": radar.get("scanned_count", 0),
+            "selected_count": 0,
+            "suppressed_duplicate_count": max(0, len(findings) - len(unseen)),
+            "suppressed_cooldown_count": len(selected),
+            "delivery_cooldown_minutes": cooldown_minutes,
+            "llm_judge": radar.get("llm_judge") if isinstance(radar.get("llm_judge"), dict) else {},
+            "quality_gate": radar.get("quality_gate") if isinstance(radar.get("quality_gate"), dict) else {},
+            "cron_audit": radar.get("cron_audit") if isinstance(radar.get("cron_audit"), dict) else {},
+        }
+        payload.update(_gtm_contract_fields(findings=selected, candidate_count=len(findings), staged=False, policy=policy))
+        payload["text"] = ""
+        return payload
 
     if not selected:
         payload = {
@@ -78,9 +112,8 @@ def build_torben_gtm_radar_adapter(
             "llm_judge": radar.get("llm_judge") if isinstance(radar.get("llm_judge"), dict) else {},
             "quality_gate": radar.get("quality_gate") if isinstance(radar.get("quality_gate"), dict) else {},
             "cron_audit": radar.get("cron_audit") if isinstance(radar.get("cron_audit"), dict) else {},
-            "public_actions_taken": 0,
-            "external_mutations": 0,
         }
+        payload.update(_gtm_contract_fields(findings=[], candidate_count=len(findings), staged=False, policy=policy))
         payload["text"] = ""
         return payload
 
@@ -95,6 +128,7 @@ def build_torben_gtm_radar_adapter(
         findings=selected,
         actions=actions,
         now=now,
+        policy_decision=gtm_automation_decision(action="draft_content", policy=policy),
     )
     payload = {
         "task": "torben_gtm_radar_adapter",
@@ -110,8 +144,6 @@ def build_torben_gtm_radar_adapter(
         "llm_judge": radar.get("llm_judge") if isinstance(radar.get("llm_judge"), dict) else {},
         "quality_gate": radar.get("quality_gate") if isinstance(radar.get("quality_gate"), dict) else {},
         "cron_audit": radar.get("cron_audit") if isinstance(radar.get("cron_audit"), dict) else {},
-        "public_actions_taken": 0,
-        "external_mutations": 0,
         "delivery": {
             "surface": "signal",
             "operator": "torben",
@@ -119,9 +151,45 @@ def build_torben_gtm_radar_adapter(
             "delivery_mode": "adapter_text",
         },
     }
+    payload.update(_gtm_contract_fields(findings=selected, candidate_count=len(findings), staged=True, policy=policy))
     if mark_delivered and stage_actions:
         _mark_delivered(state_file, state, selected, now=now)
     return payload
+
+
+def _gtm_contract_fields(
+    *,
+    findings: list[dict[str, Any]],
+    candidate_count: int,
+    staged: bool,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    first = findings[0] if findings else {}
+    route = str(first.get("content_route") or "").strip()
+    suggested = "draft_content" if staged and route != "monitor" else ("hold" if not staged else "review")
+    policy_decision = gtm_automation_decision(action=suggested, policy=policy)
+    source_refs: list[str] = []
+    for finding in findings:
+        for key in ("id", "url"):
+            value = str(finding.get(key) or "").strip()
+            if value and value not in source_refs:
+                source_refs.append(value)
+    return {
+        **ZERO_PUBLIC_MUTATION_FIELDS,
+        "status": "staged" if staged else "silent",
+        "approval_status": "approval_required" if staged else "not_required_no_action",
+        "source_refs": source_refs,
+        "thesis": str(first.get("thesis") or first.get("summary") or "").strip() or None,
+        "suggested_action": suggested,
+        "candidate_count": int(candidate_count),
+        "automation_policy": policy_decision,
+        "auto_invoke_allowed": bool(policy_decision.get("auto_invoke_allowed")),
+        "recommendation_status": (
+            "auto_surface_allowed"
+            if policy_decision.get("recommendation_allowed")
+            else "auto_surface_blocked"
+        ),
+    }
 
 
 def render_torben_gtm_radar_text(
@@ -130,6 +198,7 @@ def render_torben_gtm_radar_text(
     findings: Iterable[dict[str, Any]],
     actions: Iterable[ActionRecord],
     now: datetime,
+    policy_decision: dict[str, Any] | None = None,
 ) -> str:
     finding_rows = list(findings)
     action_rows = list(actions)
@@ -146,6 +215,7 @@ def render_torben_gtm_radar_text(
         judge_line,
         x_algorithm_brief_line(),
         "Nothing has been posted, replied to, scheduled, or sent.",
+        _automation_line(policy_decision),
         "",
     ]
     for idx, (finding, action) in enumerate(zip(finding_rows, action_rows), start=1):
@@ -328,6 +398,7 @@ def _mark_delivered(path: Path, state: dict[str, Any], findings: list[dict[str, 
     state = {
         "schema_version": 1,
         "updated_at": now_text,
+        "last_delivery_at": now_text,
         "delivered_findings": delivered,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -338,6 +409,37 @@ def _atomic_write(path: Path, text: str) -> None:
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
+
+
+def _cooldown_elapsed(state: dict[str, Any], *, now: datetime, cooldown_minutes: int) -> bool:
+    if cooldown_minutes <= 0:
+        return True
+    if str(os.getenv("TORBEN_GTM_RADAR_FORCE_DELIVERY") or "").strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    last_text = str(state.get("last_delivery_at") or "").strip()
+    if not last_text:
+        return True
+    try:
+        last = datetime.fromisoformat(last_text.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return True
+    return (now - last).total_seconds() >= cooldown_minutes * 60
+
+
+def _positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _automation_line(policy_decision: dict[str, Any] | None) -> str:
+    if not policy_decision:
+        return "Automation policy: recommendation surfacing allowed; public mutations remain approval-gated."
+    if policy_decision.get("decision") == "allowed":
+        return "Automation policy: GTM recommendations may auto-surface; public posts, replies, and schedules still require explicit approval."
+    return "Automation policy: GTM recommendation surfacing is blocked by policy; no public mutation is allowed."
 
 
 def _line(value: Any, limit: int) -> str:

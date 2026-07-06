@@ -7,12 +7,18 @@ Signal-facing operator.
 
 Finance is stage-only.
 
-`profiles/torben/scripts/torben_finance_radar.py` calls Ratatosk's Robinhood
-v0.1 cron tick and adapts the result into Torben `FIN-*` review actions.
+`profiles/torben/scripts/torben_finance_radar.py` calls Ratatosk's equity
+research/radar path and adapts the result into Torben `FIN-*` review actions.
+The radar is a broad opportunity radar, not a blue-chip watchlist. It should
+scan existing holdings, user watchlists, small/mid-cap catalysts,
+underfollowed company events, sector dislocations, unusual volume/news deltas,
+earnings/revenue inflections, product or technical catalysts, and sourced
+insider/institutional-flow signals where available.
 
-The script may run Ratatosk's bounded no-tools LLM analysis. The LLM receives
-market-research context and can produce watchlist/candidate objects, but it
-does not receive broker order tools.
+The script may run Ratatosk's bounded no-tools LLM analysis when evidence
+crosses the trigger bar. The LLM receives market-research context and can
+produce watchlist/candidate objects, but it does not receive broker order tools.
+Quiet repeated scans must write no-change artifacts without padded summaries.
 
 Eric resolved `TBC-DECIDE-LIVE-FINANCE` on 2026-06-26 as a testing-only tiny
 live finance canary. That approval does not override Ratatosk's circuit breaker,
@@ -26,6 +32,7 @@ The finance radar stays silent when:
 - Ratatosk returns no candidates.
 - candidates are below `TORBEN_FINANCE_MIN_SCORE` (default `0.70`).
 - the same candidate fingerprint was already delivered.
+- a scheduled scan has no meaningful broad-universe delta.
 
 The latest local artifacts are:
 
@@ -44,9 +51,35 @@ When a candidate crosses the review bar, Torben stages a `FIN-*` action with:
 - `orders_submitted=0`
 - `external_mutations=0`
 - `execution_blocked_until` including `TBC-DECIDE-LIVE-FINANCE`
+- `scan_window`
+- `opportunity_universe_version`
+- `candidate_class_counts`
+- `underfollowed_signal_count`
+- `llm_triggered` or `no_llm_reason`
 
 The visible Signal text must say that no order was placed, cancelled, modified,
 or approved.
+
+## Scan Cadence
+
+The default scheduled shape is a few market-day scans, not a constant noisy
+report:
+
+- market open
+- midday
+- late afternoon
+
+The sanitized cron snapshot uses `35 9,12,15 * * 1-5`. Runtime deployments may
+keep a different schedule temporarily, but the artifact must expose
+`scan_windows_count >= 2` or a degraded reason. Notifications remain
+actionable-only: no meaningful delta means no Signal wake.
+
+Config knobs:
+
+- `TORBEN_FINANCE_SCAN_WINDOW`
+- `TORBEN_FINANCE_SCAN_WINDOWS`
+- `TORBEN_FINANCE_OPPORTUNITY_UNIVERSE_VERSION`
+- `TORBEN_FINANCE_OPPORTUNITY_UNIVERSE_SCOPE`
 
 ## Live Trading Gate
 
@@ -88,8 +121,13 @@ Expected:
 
 - `wakeAgent=true`.
 - text contains `No order was placed`.
+- text names the broad opportunity universe.
 - latest JSON has `external_mutations=0`.
 - latest JSON has `broker_orders_submitted=0`.
+- latest JSON has `scan_window`.
+- latest JSON has `opportunity_universe_version`.
+- latest JSON has `scan_windows_count >= 2`.
+- latest JSON has `quiet_scan_llm_triggered=false`.
 - preview mode does not append a durable ledger action.
 
 Run the Ratatosk validator:

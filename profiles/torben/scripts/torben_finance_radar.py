@@ -12,15 +12,21 @@ from pathlib import Path
 
 from hermes_constants import get_hermes_home
 from hermes_cli.signal_coo.action_ledger import ActionLedger
+from hermes_cli.signal_coo.automation_policy import finance_automation_decisions
 from hermes_cli.signal_coo.finance import (
     DEFAULT_FINANCE_MIN_SCORE,
     DEFAULT_MAX_FINANCE_ITEMS,
+    DEFAULT_FINANCE_SCAN_WINDOWS,
+    DEFAULT_OPPORTUNITY_UNIVERSE_SCOPE,
+    DEFAULT_OPPORTUNITY_UNIVERSE_VERSION,
     build_torben_finance_radar_adapter,
     write_finance_radar_artifacts,
 )
 
 DEFAULT_RATATOSK_ROOT = Path("/Users/ericfreeman/ratatosk")
 DEFAULT_TIMEOUT_SECONDS = 180
+DEFAULT_RATATOSK_LIVE_TRADING = "0"
+DEFAULT_ROBINHOOD_LIVE = "0"
 
 
 def _truthy(value: str | None) -> bool:
@@ -41,7 +47,45 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def _ratatosk_command(*, phase: str | None, dry_run: bool, run_llm: bool, token_budget: int) -> list[str]:
+def _env_list(name: str, default: tuple[str, ...]) -> list[str]:
+    value = str(os.getenv(name) or "").strip()
+    if not value:
+        return list(default)
+    items = [item.strip() for item in value.split(",") if item.strip()]
+    return items or list(default)
+
+
+def _default_scan_window() -> str:
+    override = str(os.getenv("TORBEN_FINANCE_SCAN_WINDOW") or "").strip()
+    if override:
+        return override
+    phase = str(os.getenv("TORBEN_FINANCE_PHASE") or "").strip()
+    if phase:
+        return phase
+    now = datetime.now(timezone.utc)
+    if 13 <= now.hour < 15:
+        return "market_open"
+    if 15 <= now.hour < 18:
+        return "midday"
+    if 18 <= now.hour < 21:
+        return "late_afternoon"
+    return "off_hours"
+
+
+def _attach_radar_contract_metadata(ratatosk_run: dict) -> None:
+    ratatosk_run.setdefault(
+        "opportunity_universe_version",
+        str(os.getenv("TORBEN_FINANCE_OPPORTUNITY_UNIVERSE_VERSION") or DEFAULT_OPPORTUNITY_UNIVERSE_VERSION),
+    )
+    ratatosk_run.setdefault(
+        "opportunity_universe_scope",
+        _env_list("TORBEN_FINANCE_OPPORTUNITY_UNIVERSE_SCOPE", DEFAULT_OPPORTUNITY_UNIVERSE_SCOPE),
+    )
+    ratatosk_run.setdefault("scan_window", _default_scan_window())
+    ratatosk_run.setdefault("scan_windows", _env_list("TORBEN_FINANCE_SCAN_WINDOWS", DEFAULT_FINANCE_SCAN_WINDOWS))
+
+
+def _ratatosk_legacy_command(*, phase: str | None, dry_run: bool, run_llm: bool, token_budget: int) -> list[str]:
     command = [
         "uv",
         "run",
@@ -59,6 +103,31 @@ def _ratatosk_command(*, phase: str | None, dry_run: bool, run_llm: bool, token_
     return command
 
 
+def _ratatosk_equity_packet_command(*, watchlist_path: str) -> list[str]:
+    return [
+        "uv",
+        "run",
+        "python",
+        "scripts/equity_scan_packet.py",
+        "--json",
+        "--watchlist",
+        watchlist_path,
+    ]
+
+
+def _ratatosk_research_packet_command(*, fixture: str | None = None) -> list[str]:
+    command = [
+        "uv",
+        "run",
+        "python",
+        "scripts/equity_research_signal_cron.py",
+        "--json",
+    ]
+    if fixture:
+        command.extend(["--fixture", fixture])
+    return command
+
+
 def _extract_json_object(text: str) -> dict:
     try:
         payload = json.loads(text)
@@ -73,17 +142,12 @@ def _extract_json_object(text: str) -> dict:
     return payload
 
 
-def _run_ratatosk_tick() -> tuple[dict, dict]:
-    root = Path(os.getenv("TORBEN_FINANCE_RATATOSK_ROOT") or DEFAULT_RATATOSK_ROOT)
-    phase = str(os.getenv("TORBEN_FINANCE_PHASE") or "").strip() or None
-    preview = _truthy(os.getenv("TORBEN_FINANCE_RADAR_PREVIEW"))
-    dry_run = preview or _truthy(os.getenv("TORBEN_FINANCE_RATATOSK_DRY_RUN"))
-    run_llm = not _truthy(os.getenv("TORBEN_FINANCE_DISABLE_LLM"))
-    token_budget = _env_int("TORBEN_FINANCE_TOKEN_BUDGET", 2500)
-    timeout_seconds = _env_int("TORBEN_FINANCE_RATATOSK_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)
-    command = _ratatosk_command(phase=phase, dry_run=dry_run, run_llm=run_llm, token_budget=token_budget)
+def _run_ratatosk_command(command: list[str], *, root: Path, timeout_seconds: int) -> tuple[dict, dict]:
     env = os.environ.copy()
     env.setdefault("UV_PROJECT_ENVIRONMENT", "venv")
+    env.setdefault("RATATOSK_LIVE_TRADING", DEFAULT_RATATOSK_LIVE_TRADING)
+    env.setdefault("ROBINHOOD_LIVE", DEFAULT_ROBINHOOD_LIVE)
+    env.setdefault("ROBINHOOD_EQUITY_LIVE", "0")
     env["NO_COLOR"] = "1"
     env["TERM"] = "dumb"
     env["RATATOSK_ROOT"] = str(root)
@@ -100,7 +164,7 @@ def _run_ratatosk_tick() -> tuple[dict, dict]:
     elapsed = round(time.monotonic() - started, 3)
     if result.returncode != 0:
         raise RuntimeError(
-            "Ratatosk Robinhood v0.1 tick failed "
+            "Ratatosk finance evidence command failed "
             f"(returncode={result.returncode}): {(result.stderr or result.stdout)[-500:]}"
         )
     payload = _extract_json_object(result.stdout or "")
@@ -109,13 +173,92 @@ def _run_ratatosk_tick() -> tuple[dict, dict]:
         "profile": "ratatosk",
         "root": str(root),
         "command": command,
-        "dry_run": dry_run,
-        "run_llm": run_llm,
         "returncode": result.returncode,
         "elapsed_seconds": elapsed,
+        "live_safety_env": {
+            "RATATOSK_LIVE_TRADING": env.get("RATATOSK_LIVE_TRADING"),
+            "ROBINHOOD_LIVE": env.get("ROBINHOOD_LIVE"),
+            "ROBINHOOD_EQUITY_LIVE": env.get("ROBINHOOD_EQUITY_LIVE"),
+        },
         "stderr_tail": (result.stderr or "")[-500:],
     }
     return payload, payload["torben_source_refresh"]
+
+
+def _run_ratatosk_tick() -> tuple[dict, dict]:
+    fixture_path = str(os.getenv("TORBEN_FINANCE_RADAR_FIXTURE") or "").strip()
+    if fixture_path:
+        payload = json.loads(Path(fixture_path).read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("TORBEN_FINANCE_RADAR_FIXTURE must contain a JSON object")
+        payload["torben_source_refresh"] = {
+            "status": "success",
+            "profile": "fixture",
+            "root": fixture_path,
+            "command": ["fixture", fixture_path],
+            "returncode": 0,
+            "elapsed_seconds": 0,
+            "stderr_tail": "",
+        }
+        return payload, payload["torben_source_refresh"]
+
+    root = Path(os.getenv("TORBEN_FINANCE_RATATOSK_ROOT") or DEFAULT_RATATOSK_ROOT)
+    timeout_seconds = _env_int("TORBEN_FINANCE_RATATOSK_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)
+    if not _truthy(os.getenv("TORBEN_FINANCE_USE_LEGACY_ROBINHOOD_V01")):
+        watchlist_path = str(os.getenv("TORBEN_FINANCE_EQUITY_WATCHLIST") or "state/equity-watchlist.json")
+        if not _truthy(os.getenv("TORBEN_FINANCE_DISABLE_RESEARCH_CRON")):
+            research_fixture = str(os.getenv("TORBEN_FINANCE_RESEARCH_FIXTURE") or "").strip() or None
+            try:
+                payload, refresh = _run_ratatosk_command(
+                    _ratatosk_research_packet_command(fixture=research_fixture),
+                    root=root,
+                    timeout_seconds=timeout_seconds,
+                )
+            except Exception as exc:  # noqa: BLE001
+                fallback_payload, fallback_refresh = _run_ratatosk_command(
+                    _ratatosk_equity_packet_command(watchlist_path=watchlist_path),
+                    root=root,
+                    timeout_seconds=timeout_seconds,
+                )
+                fallback_refresh["preferred_source"] = "ratatosk_equity_research_agent_v1"
+                fallback_refresh["fallback_reason"] = f"research_cron_unavailable:{type(exc).__name__}"
+                fallback_refresh["research_error"] = str(exc)[:300]
+                return fallback_payload, fallback_refresh
+            if str(payload.get("status") or "") == "data_source_degraded" and not research_fixture:
+                fallback_payload, fallback_refresh = _run_ratatosk_command(
+                    _ratatosk_equity_packet_command(watchlist_path=watchlist_path),
+                    root=root,
+                    timeout_seconds=timeout_seconds,
+                )
+                fallback_refresh["preferred_source"] = "ratatosk_equity_research_agent_v1"
+                fallback_refresh["fallback_reason"] = "research_cron_degraded"
+                fallback_refresh["research_attempt"] = refresh
+                fallback_refresh["research_status"] = payload.get("status")
+                return fallback_payload, fallback_refresh
+            return payload, refresh
+
+        return _run_ratatosk_command(
+            _ratatosk_equity_packet_command(watchlist_path=watchlist_path),
+            root=root,
+            timeout_seconds=timeout_seconds,
+        )
+
+    # Legacy Robinhood v0.1 is retained as a bounded scheduler/control canary,
+    # not the default production source for visible FIN candidates.
+    phase = str(os.getenv("TORBEN_FINANCE_PHASE") or "").strip() or None
+    preview = _truthy(os.getenv("TORBEN_FINANCE_RADAR_PREVIEW"))
+    dry_run = preview or _truthy(os.getenv("TORBEN_FINANCE_RATATOSK_DRY_RUN"))
+    run_llm = not _truthy(os.getenv("TORBEN_FINANCE_DISABLE_LLM"))
+    token_budget = _env_int("TORBEN_FINANCE_TOKEN_BUDGET", 2500)
+    payload, refresh = _run_ratatosk_command(
+        _ratatosk_legacy_command(phase=phase, dry_run=dry_run, run_llm=run_llm, token_budget=token_budget),
+        root=root,
+        timeout_seconds=timeout_seconds,
+    )
+    refresh["dry_run"] = dry_run
+    refresh["run_llm"] = run_llm
+    refresh["legacy_control_canary"] = True
+    return payload, refresh
 
 
 def _failure_payload(exc: Exception) -> dict:
@@ -132,9 +275,28 @@ def _failure_payload(exc: Exception) -> dict:
         "external_mutations": 0,
         "orders_submitted": 0,
         "broker_orders_submitted": 0,
+        "scan_window": _default_scan_window(),
+        "scan_windows": _env_list("TORBEN_FINANCE_SCAN_WINDOWS", DEFAULT_FINANCE_SCAN_WINDOWS),
+        "scan_windows_count": len(_env_list("TORBEN_FINANCE_SCAN_WINDOWS", DEFAULT_FINANCE_SCAN_WINDOWS)),
+        "opportunity_universe_version": str(
+            os.getenv("TORBEN_FINANCE_OPPORTUNITY_UNIVERSE_VERSION") or DEFAULT_OPPORTUNITY_UNIVERSE_VERSION
+        ),
+        "opportunity_universe_scope": _env_list(
+            "TORBEN_FINANCE_OPPORTUNITY_UNIVERSE_SCOPE",
+            DEFAULT_OPPORTUNITY_UNIVERSE_SCOPE,
+        ),
+        "candidate_class_counts": {},
+        "underfollowed_signal_count": 0,
+        "llm_triggered": False,
+        "quiet_scan_llm_triggered": False,
+        "llm_trigger_reason": None,
+        "no_llm_reason": "source refresh failed before LLM-trigger evaluation",
+        "automation_policy": finance_automation_decisions(),
+        "auto_invoke_allowed": True,
+        "recommendation_status": "auto_surface_allowed",
         "text": (
             "Torben / Finance Radar\n\n"
-            "Ratatosk Robinhood v0.1 stage-only analysis failed before it could produce a useful finance review.\n"
+            "Ratatosk equity evidence refresh failed before it could produce a useful finance review.\n"
             f"Reason: {type(exc).__name__}: {str(exc)[:180]}\n"
             "No broker order was placed, cancelled, modified, or approved.\n"
         ),
@@ -191,12 +353,13 @@ def main() -> int:
 
     try:
         ratatosk_run, source_refresh = _run_ratatosk_tick()
+        _attach_radar_contract_metadata(ratatosk_run)
         min_score = _env_float("TORBEN_FINANCE_MIN_SCORE", DEFAULT_FINANCE_MIN_SCORE)
-        if preview and force_wake:
+        if preview and force_wake and _truthy(os.getenv("TORBEN_FINANCE_ALLOW_SYNTHETIC_PREVIEW_CANDIDATE")):
             _ensure_preview_canary_candidate(ratatosk_run, min_score=min_score)
         payload = build_torben_finance_radar_adapter(
             ratatosk_run,
-            ledger=ActionLedger(state_dir / "torben-action-ledger.json"),
+            ledger=ActionLedger(state_dir / "torben-action-ledger.jsonl"),
             state_path=state_dir / "torben-finance-radar-state.json",
             min_score=min_score,
             max_items=_env_int("TORBEN_FINANCE_MAX_ITEMS", DEFAULT_MAX_FINANCE_ITEMS),

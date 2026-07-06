@@ -26,6 +26,9 @@ Use this skill when Eric asks to adjust Torben's backend behavior, scheduled job
 3. Prefer class-level updates.
    - If a recurring workflow changed, update the scheduled job prompt and the script-provided contract so future LLM runs see it.
    - If Eric expressed a durable preference, save compact memory and also encode it in the skill or backend prompt that governs the class of task.
+   - Durable profile memory belongs in the active profile memory file only: `memories/MEMORY.md` under that profile's `HERMES_HOME`.
+   - New reusable memory entries should carry `trust`, `date`, `source`, and `status`. Use `canonical` only for human-approved rules, official docs, or stable project contracts; use `project` for repo/runtime observations; use `temporary` for one-offs.
+   - Do not store secrets, tokens, passwords, private identity details beyond the useful rule, customer data, or play-by-play session logs.
 
 ## Workflow
 
@@ -53,6 +56,12 @@ Use this skill when Eric asks to adjust Torben's backend behavior, scheduled job
    - Re-read or search for the new guardrail text in the profile to confirm it landed in the intended places.
    - For avatar/icon updates, verify the provider accepted the mutation and read back the resulting image.
    - Report exactly what changed and what was verified.
+
+5. Run the Loopy memory review when there is a reusable lesson.
+   - End-of-task entries should be compressed rules, not transcripts.
+   - Prefer dry-run first: `python profiles/torben/scripts/torben_memory_loop.py task-review --source <task> --entry "<reusable rule>" --json`.
+   - Apply only after confirming the diff targets the active profile memory: add `--apply`.
+   - Weekly memory hygiene is `python profiles/torben/scripts/torben_memory_loop.py weekly-review --json`; applying it backs up `MEMORY.md` first, marks old or external-fact entries `needs-review`, and marks duplicates `stale` instead of hard-deleting.
 
 ## Email draft guardrails for Eric
 

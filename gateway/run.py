@@ -42,7 +42,7 @@ import sqlite3
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional, Any, List, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
@@ -385,6 +385,36 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     if _looks_like_gateway_provider_error(redacted):
         return _gateway_provider_error_reply(redacted)
     return redacted
+
+
+def _coerce_gateway_text_preview(value: Any) -> str:
+    """Return a stable text representation for logging and shortcut routers."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("text", "body", "message", "content", "final_response"):
+            nested = value.get(key)
+            if isinstance(nested, str):
+                return nested
+            if isinstance(nested, dict):
+                nested_text = _coerce_gateway_text_preview(nested)
+                if nested_text:
+                    return nested_text
+    return str(value)
+
+
+def _platform_response_for_shortcut_result(value: Any) -> str:
+    """Return text for the outer platform sender after a shortcut handler.
+
+    Some shortcut handlers send their own acknowledgement so they can persist a
+    structured result locally. In that case the outer platform loop must not
+    treat the result dict as response text.
+    """
+    if isinstance(value, dict) and value.get("already_delivered") is True:
+        return ""
+    return _coerce_gateway_text_preview(value)
 
 
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
@@ -9397,28 +9427,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ):
         if getattr(source, "platform", None) != Platform.SIGNAL:
             return None
-        raw_text = str(getattr(event, "text", None) or "").strip()
+        raw_text = _coerce_gateway_text_preview(getattr(event, "text", None)).strip()
         if not raw_text:
             return None
         ledger_path = _hermes_home / "state" / "torben-action-ledger.json"
         if not ledger_path.exists():
             return None
         try:
-            from hermes_cli.signal_coo import ActionLedger, route_gtm_radar_reply
-
-            result = route_gtm_radar_reply(
-                ledger=ActionLedger(ledger_path),
-                reply_text=raw_text,
-                output_dir=_hermes_home / "state" / "gtm-content-packages",
-                approved_by="signal-reply",
+            from hermes_cli.signal_coo import (
+                ActionLedger,
+                route_gtm_radar_reply,
+                send_approved_gtm_public_replies,
             )
+
+            ledger = ActionLedger(ledger_path)
+            route_now = None
+            if isinstance(persist_user_timestamp, datetime):
+                route_now = persist_user_timestamp.astimezone(timezone.utc)
+            elif persist_user_timestamp is not None:
+                try:
+                    route_now = datetime.fromtimestamp(float(persist_user_timestamp), timezone.utc)
+                except (TypeError, ValueError, OSError, OverflowError):
+                    route_now = None
+            public_reply_result = send_approved_gtm_public_replies(
+                ledger=ledger,
+                reply_text=raw_text,
+                approved_by="signal-reply",
+                dry_run=False,
+                yes=True,
+                now=route_now,
+            )
+            if public_reply_result.handled:
+                result = None
+                response_text = public_reply_result.text or "Torben handled the approved GTM public reply.\n"
+                result_payload = {"torben_gtm_public_reply": public_reply_result.to_dict()}
+            else:
+                result = route_gtm_radar_reply(
+                    ledger=ledger,
+                    reply_text=raw_text,
+                    output_dir=_hermes_home / "state" / "gtm-content-packages",
+                    approved_by="signal-reply",
+                    now=route_now,
+                )
+                if not result.handled:
+                    return None
+                response_text = result.text or "Torben staged the GTM reply. Nothing was posted or sent.\n"
+                result_payload = {"torben_gtm_reply_router": result.to_dict()}
         except Exception:
             logger.debug("Torben GTM reply router failed before handling", exc_info=True)
             return None
-        if not result.handled:
-            return None
 
-        response_text = result.text or "Torben staged the GTM reply. Nothing was posted or sent.\n"
+        already_delivered = False
         adapter = self.adapters.get(source.platform)
         if adapter and source.chat_id:
             try:
@@ -9430,6 +9489,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self._reply_anchor_for_event(event),
                     ),
                 )
+                already_delivered = True
             except Exception:
                 logger.warning("Failed to send Torben GTM reply acknowledgement", exc_info=True)
 
@@ -9468,26 +9528,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             logger.debug("Failed to persist Torben GTM reply router transcript", exc_info=True)
-        logger.info(
-            "torben gtm reply routed: status=%s package=%s refs=%s",
-            result.status,
-            result.package_action.handle if result.package_action else "",
-            ",".join(action.handle for action in result.referenced_actions),
-        )
-        return {
+        if result is not None:
+            logger.info(
+                "torben gtm reply routed: status=%s package=%s refs=%s",
+                result.status,
+                result.package_action.handle if result.package_action else "",
+                ",".join(action.handle for action in result.referenced_actions),
+            )
+        else:
+            logger.info("torben gtm public reply handled")
+        payload = {
             "success": True,
             "final_response": response_text,
             "api_calls": 0,
-            "torben_gtm_reply_router": result.to_dict(),
+            "already_delivered": already_delivered,
         }
+        payload.update(result_payload)
+        return payload
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        _msg_preview = (event.text or "")[:80].replace("\n", " ")
+        _msg_preview = _coerce_gateway_text_preview(getattr(event, "text", None))[:80].replace("\n", " ")
         _reply_id = getattr(event, "reply_to_message_id", None)
-        _reply_txt = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
+        _reply_txt = _coerce_gateway_text_preview(getattr(event, "reply_to_text", None))[:80].replace("\n", " ")
         logger.info(
             "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
             _platform_name, source.user_name or source.user_id or "unknown",
@@ -10222,7 +10287,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_timestamp=persist_user_timestamp,
         )
         if _torben_gtm_result is not None:
-            return _torben_gtm_result
+            return _platform_response_for_shortcut_result(_torben_gtm_result)
 
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
@@ -10286,7 +10351,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
                 return None
 
-            response = agent_result.get("final_response") or ""
+            response = _coerce_gateway_text_preview(agent_result.get("final_response"))
             try:
                 from gateway.response_filters import is_intentional_silence_agent_result
                 _intentional_silence = is_intentional_silence_agent_result(
@@ -11972,7 +12037,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             result = await self._run_in_executor_with_context(run_sync)
 
-            response = result.get("final_response", "") if result else ""
+            response = _coerce_gateway_text_preview(result.get("final_response")) if result else ""
             if not response and result and result.get("error"):
                 response = f"Error: {result['error']}"
 
@@ -16797,7 +16862,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _stream_consumer.finish()
             
             # Return final response, or a message if something went wrong
-            final_response = result.get("final_response")
+            final_response = _coerce_gateway_text_preview(result.get("final_response"))
 
             # Extract actual token counts from the agent instance used for this run
             _last_prompt_toks = 0

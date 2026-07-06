@@ -32,6 +32,12 @@ from agent.model_metadata import (
 )
 
 
+def _model_metadata_module():
+    import agent.model_metadata as mm
+
+    return mm
+
+
 # =========================================================================
 # Token estimation
 # =========================================================================
@@ -153,7 +159,7 @@ class TestDefaultContextLengths:
                 ("grok-beta", 131072),
             ]
             for model_id, expected_ctx in cases:
-                actual = get_model_context_length(model_id)
+                actual = _model_metadata_module().get_model_context_length(model_id)
                 assert actual == expected_ctx, (
                     f"{model_id}: expected {expected_ctx}, got {actual}"
                 )
@@ -177,7 +183,7 @@ class TestDefaultContextLengths:
         with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
              patch("agent.model_metadata._query_ollama_api_show", return_value=None), \
              patch("agent.models_dev.fetch_models_dev", return_value=registry):
-            assert get_model_context_length(
+            assert _model_metadata_module().get_model_context_length(
                 "grok-build-0.1",
                 provider="xai-oauth",
                 base_url="https://api.x.ai/v1",
@@ -216,7 +222,7 @@ class TestDefaultContextLengths:
                 ("deepseek-reasoner", 1_000_000),
             ]
             for model_id, expected_ctx in cases:
-                actual = get_model_context_length(model_id)
+                actual = _model_metadata_module().get_model_context_length(model_id)
                 assert actual == expected_ctx, (
                     f"{model_id}: expected {expected_ctx}, got {actual}"
                 )
@@ -238,13 +244,13 @@ class TestDefaultContextLengths:
              mock_patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
              mock_patch("agent.model_metadata.get_cached_context_length", return_value=None):
             # GLM-5.2 (1M) must NOT fall through to the generic 202K entry
-            assert get_model_context_length("glm-5.2") == 1_048_576
+            assert _model_metadata_module().get_model_context_length("glm-5.2") == 1_048_576
             # Vendor-prefixed forms (zai provider, zhipu alias)
-            assert get_model_context_length("zai/glm-5.2") == 1_048_576
-            assert get_model_context_length("zhipu/glm-5.2") == 1_048_576
+            assert _model_metadata_module().get_model_context_length("zai/glm-5.2") == 1_048_576
+            assert _model_metadata_module().get_model_context_length("zhipu/glm-5.2") == 1_048_576
             # Older GLM variants still resolve to the generic 202K fallback
-            assert get_model_context_length("glm-5") == 202752
-            assert get_model_context_length("glm-5.1") == 202752
+            assert _model_metadata_module().get_model_context_length("glm-5") == 202752
+            assert _model_metadata_module().get_model_context_length("glm-5.1") == 202752
 
     def test_openrouter_live_metadata_beats_hardcoded_catchall(self):
         """OpenRouter-routed slugs resolve via the live OR catalog before the
@@ -271,12 +277,12 @@ class TestDefaultContextLengths:
              mock_patch("agent.model_metadata.get_cached_context_length", return_value=None), \
              mock_patch("agent.models_dev.lookup_models_dev_context", return_value=None):
             # The bug: would have returned 200_000 via the "claude" catch-all.
-            assert get_model_context_length(
+            assert _model_metadata_module().get_model_context_length(
                 "anthropic/claude-fable-5", base_url=or_url, provider="openrouter"
             ) == 1_000_000
             # A genuinely-200k model still resolves to its real OR value — the
             # fix reads per-model context, it does not blanket-bump to 1M.
-            assert get_model_context_length(
+            assert _model_metadata_module().get_model_context_length(
                 "anthropic/claude-haiku-4.5", base_url=or_url, provider="openrouter"
             ) == 200_000
 
@@ -294,7 +300,7 @@ class TestDefaultContextLengths:
              mock_patch("agent.model_metadata._query_ollama_api_show", return_value=None), \
              mock_patch("agent.model_metadata.get_cached_context_length", return_value=None), \
              mock_patch("agent.models_dev.lookup_models_dev_context", return_value=None):
-            ctx = get_model_context_length(
+            ctx = _model_metadata_module().get_model_context_length(
                 "moonshotai/kimi-k2.6", base_url=or_url, provider="openrouter"
             )
             assert ctx != 32768, "Kimi 32k OR underreport must not be accepted"
@@ -337,7 +343,7 @@ class TestCodexOAuthContextLength:
         with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
              patch("agent.model_metadata.save_context_length"):
             for model, expected_ctx in expected.items():
-                ctx = get_model_context_length(
+                ctx = _model_metadata_module().get_model_context_length(
                     model=model,
                     base_url="https://chatgpt.com/backend-api/codex",
                     api_key="",
@@ -365,13 +371,13 @@ class TestCodexOAuthContextLength:
         with patch("agent.model_metadata.requests.get", return_value=fake_response), \
              patch("agent.model_metadata.get_cached_context_length", return_value=None), \
              patch("agent.model_metadata.save_context_length"):
-            ctx_55 = get_model_context_length(
+            ctx_55 = _model_metadata_module().get_model_context_length(
                 model="gpt-5.5",
                 base_url="https://chatgpt.com/backend-api/codex",
                 api_key="fake-token",
                 provider="openai-codex",
             )
-            ctx_54 = get_model_context_length(
+            ctx_54 = _model_metadata_module().get_model_context_length(
                 model="gpt-5.4",
                 base_url="https://chatgpt.com/backend-api/codex",
                 api_key="fake-token",
@@ -392,7 +398,7 @@ class TestCodexOAuthContextLength:
         with patch("agent.model_metadata.requests.get", return_value=fake_response), \
              patch("agent.model_metadata.get_cached_context_length", return_value=None), \
              patch("agent.model_metadata.save_context_length"):
-            ctx = get_model_context_length(
+            ctx = _model_metadata_module().get_model_context_length(
                 model="gpt-5.5",
                 base_url="https://chatgpt.com/backend-api/codex",
                 api_key="expired-token",
@@ -414,7 +420,7 @@ class TestCodexOAuthContextLength:
              patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
              patch("agent.model_metadata.get_cached_context_length", return_value=None), \
              patch("agent.models_dev.lookup_models_dev_context", return_value=None):
-            ctx = get_model_context_length(
+            ctx = _model_metadata_module().get_model_context_length(
                 model="openai/gpt-5.5",
                 base_url="https://openrouter.ai/api/v1",
                 api_key="",
@@ -759,91 +765,103 @@ class TestNousPortalContextResolution:
 class TestGetModelContextLength:
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_known_model_from_api(self, mock_fetch):
+        mm = _model_metadata_module()
         mock_fetch.return_value = {
             "test/model": {"context_length": 32000}
         }
-        assert get_model_context_length("test/model") == 32000
+        assert mm.get_model_context_length("test/model") == 32000
 
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_fallback_to_defaults(self, mock_fetch):
+        mm = _model_metadata_module()
         mock_fetch.return_value = {}
-        assert get_model_context_length("anthropic/claude-sonnet-4") == 200000
+        assert mm.get_model_context_length("anthropic/claude-sonnet-4") == 200000
 
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_unknown_model_returns_first_probe_tier(self, mock_fetch):
+        mm = _model_metadata_module()
         mock_fetch.return_value = {}
-        assert get_model_context_length("unknown/never-heard-of-this") == CONTEXT_PROBE_TIERS[0]
+        assert mm.get_model_context_length("unknown/never-heard-of-this") == CONTEXT_PROBE_TIERS[0]
 
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_partial_match_in_defaults(self, mock_fetch):
+        mm = _model_metadata_module()
         mock_fetch.return_value = {}
-        assert get_model_context_length("openai/gpt-4o") == 128000
+        assert mm.get_model_context_length("openai/gpt-4o") == 128000
 
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_qwen3_coder_plus_context_length(self, mock_fetch):
         """qwen3-coder-plus has a 1M context window, not the generic 128K Qwen default."""
+        mm = _model_metadata_module()
         mock_fetch.return_value = {}
-        assert get_model_context_length("qwen3-coder-plus") == 1000000
+        assert mm.get_model_context_length("qwen3-coder-plus") == 1000000
 
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_qwen3_coder_context_length(self, mock_fetch):
         """qwen3-coder has a 256K context window, not the generic 128K Qwen default."""
+        mm = _model_metadata_module()
         mock_fetch.return_value = {}
-        assert get_model_context_length("qwen3-coder") == 262144
+        assert mm.get_model_context_length("qwen3-coder") == 262144
 
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_qwen3_6_plus_context_length(self, mock_fetch):
         """qwen3.6-plus has a 1M context window, not the generic 128K Qwen default."""
+        mm = _model_metadata_module()
         mock_fetch.return_value = {}
-        assert get_model_context_length("qwen3.6-plus") == 1048576
+        assert mm.get_model_context_length("qwen3.6-plus") == 1048576
         # Provider-prefixed variants must resolve to the same explicit entry
         # via the longest-substring fallback (no portal/OR cache available).
-        assert get_model_context_length("qwen/qwen3.6-plus") == 1048576
-        assert get_model_context_length("dashscope/qwen3.6-plus") == 1048576
+        assert mm.get_model_context_length("qwen/qwen3.6-plus") == 1048576
+        assert mm.get_model_context_length("dashscope/qwen3.6-plus") == 1048576
 
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_qwen_generic_context_length(self, mock_fetch):
         """Generic qwen models still get the 128K default."""
+        mm = _model_metadata_module()
         mock_fetch.return_value = {}
-        assert get_model_context_length("qwen3-plus") == 131072
+        assert mm.get_model_context_length("qwen3-plus") == 131072
 
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_api_missing_context_length_key(self, mock_fetch):
         """Model in API but without context_length → defaults to the top
         probe tier (currently 256K)."""
+        mm = _model_metadata_module()
         mock_fetch.return_value = {"test/model": {"name": "Test"}}
-        assert get_model_context_length("test/model") == CONTEXT_PROBE_TIERS[0]
+        assert mm.get_model_context_length("test/model") == CONTEXT_PROBE_TIERS[0]
 
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_cache_takes_priority_over_api(self, mock_fetch, tmp_path):
         """Persistent cache should be checked BEFORE API metadata."""
+        mm = _model_metadata_module()
         mock_fetch.return_value = {"my/model": {"context_length": 999999}}
         cache_file = tmp_path / "cache.yaml"
         with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
-            save_context_length("my/model", "http://local", 32768)
-            result = get_model_context_length("my/model", base_url="http://local")
+            mm.save_context_length("my/model", "http://local", 32768)
+            result = mm.get_model_context_length("my/model", base_url="http://local")
             assert result == 32768  # cache wins over API's 999999
 
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_no_base_url_skips_cache(self, mock_fetch, tmp_path):
         """Without base_url, cache lookup is skipped."""
+        mm = _model_metadata_module()
         mock_fetch.return_value = {}
         cache_file = tmp_path / "cache.yaml"
         with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
-            save_context_length("custom/model", "http://local", 32768)
+            mm.save_context_length("custom/model", "http://local", 32768)
             # No base_url → cache skipped → falls to probe tier
-            result = get_model_context_length("custom/model")
+            result = mm.get_model_context_length("custom/model")
             assert result == CONTEXT_PROBE_TIERS[0]
 
     @patch("agent.model_metadata.fetch_model_metadata")
     @patch("agent.model_metadata.fetch_endpoint_model_metadata")
     def test_custom_endpoint_metadata_beats_fuzzy_default(self, mock_endpoint_fetch, mock_fetch):
+        mm = _model_metadata_module()
         mock_fetch.return_value = {}
         mock_endpoint_fetch.return_value = {
             "zai-org/GLM-5-TEE": {"context_length": 65536}
         }
 
-        result = get_model_context_length(
+        result = mm.get_model_context_length(
             "zai-org/GLM-5-TEE",
             base_url="https://llm.chutes.ai/v1",
             api_key="test-key",
@@ -861,11 +879,12 @@ class TestGetModelContextLength:
         custom-endpoint branch short-circuited before the catalog lookup.
         See #38865.
         """
+        mm = _model_metadata_module()
         mock_fetch.return_value = {}
         mock_endpoint_fetch.return_value = {}
 
         # GLM-5-TEE matches the "glm" entry in DEFAULT_CONTEXT_LENGTHS
-        result = get_model_context_length(
+        result = mm.get_model_context_length(
             "zai-org/GLM-5-TEE",
             base_url="https://llm.chutes.ai/v1",
             api_key="test-key",
@@ -876,12 +895,13 @@ class TestGetModelContextLength:
     @patch("agent.model_metadata.fetch_endpoint_model_metadata")
     def test_custom_endpoint_single_model_fallback(self, mock_endpoint_fetch, mock_fetch):
         """Single-model servers: use the only model even if name doesn't match."""
+        mm = _model_metadata_module()
         mock_fetch.return_value = {}
         mock_endpoint_fetch.return_value = {
             "Qwen3.5-9B-Q4_K_M.gguf": {"context_length": 131072}
         }
 
-        result = get_model_context_length(
+        result = mm.get_model_context_length(
             "qwen3.5:9b",
             base_url="http://myserver.example.com:8080/v1",
             api_key="test-key",
@@ -893,13 +913,14 @@ class TestGetModelContextLength:
     @patch("agent.model_metadata.fetch_endpoint_model_metadata")
     def test_custom_endpoint_fuzzy_substring_match(self, mock_endpoint_fetch, mock_fetch):
         """Fuzzy match: configured model name is substring of endpoint model."""
+        mm = _model_metadata_module()
         mock_fetch.return_value = {}
         mock_endpoint_fetch.return_value = {
             "org/llama-3.3-70b-instruct-fp8": {"context_length": 131072},
             "org/qwen-2.5-72b": {"context_length": 32768},
         }
 
-        result = get_model_context_length(
+        result = mm.get_model_context_length(
             "llama-3.3-70b-instruct",
             base_url="http://myserver.example.com:8080/v1",
             api_key="test-key",
@@ -910,11 +931,12 @@ class TestGetModelContextLength:
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_config_context_length_overrides_all(self, mock_fetch):
         """Explicit config_context_length takes priority over everything."""
+        mm = _model_metadata_module()
         mock_fetch.return_value = {
             "test/model": {"context_length": 200000}
         }
 
-        result = get_model_context_length(
+        result = mm.get_model_context_length(
             "test/model",
             config_context_length=65536,
         )
@@ -924,9 +946,10 @@ class TestGetModelContextLength:
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_config_context_length_zero_is_ignored(self, mock_fetch):
         """config_context_length=0 should be treated as unset."""
+        mm = _model_metadata_module()
         mock_fetch.return_value = {}
 
-        result = get_model_context_length(
+        result = mm.get_model_context_length(
             "anthropic/claude-sonnet-4",
             config_context_length=0,
         )
@@ -936,9 +959,10 @@ class TestGetModelContextLength:
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_config_context_length_none_is_ignored(self, mock_fetch):
         """config_context_length=None should be treated as unset."""
+        mm = _model_metadata_module()
         mock_fetch.return_value = {}
 
-        result = get_model_context_length(
+        result = mm.get_model_context_length(
             "anthropic/claude-sonnet-4",
             config_context_length=None,
         )
@@ -955,6 +979,7 @@ class TestGetModelContextLength:
         the catalog lookup, capping context at 256K even for models like
         claude-opus-4-8 that are in the hardcoded catalog with 1M.
         """
+        mm = _model_metadata_module()
         mock_fetch.return_value = {}
 
         # Patch all the probe functions that the custom-endpoint branch calls
@@ -980,14 +1005,14 @@ class TestGetModelContextLength:
         ):
             # A known model behind a custom proxy should resolve to its
             # catalog value (1M), NOT the 256K fallback.
-            ctx = get_model_context_length(
+            ctx = mm.get_model_context_length(
                 "claude-opus-4-8",
                 base_url="https://my-gateway.example.com/v1/claude",
             )
             assert ctx == 1000000, f"Expected 1000000, got {ctx}"
 
             # Another known model
-            ctx2 = get_model_context_length(
+            ctx2 = mm.get_model_context_length(
                 "claude-sonnet-4-6",
                 base_url="https://my-gateway.example.com/v1/claude",
             )
@@ -995,7 +1020,7 @@ class TestGetModelContextLength:
 
             # An unknown model on a custom endpoint should still fall back
             # to 256K (no catalog match).
-            ctx3 = get_model_context_length(
+            ctx3 = mm.get_model_context_length(
                 "totally-unknown-model",
                 base_url="https://my-gateway.example.com/v1/claude",
             )
@@ -1023,7 +1048,8 @@ class TestBedrockContextResolution:
     @patch("agent.model_metadata.fetch_endpoint_model_metadata")
     def test_bedrock_provider_returns_static_table_before_probe(self, mock_fetch):
         """provider='bedrock' resolves via static table, bypasses /models probe."""
-        ctx = get_model_context_length(
+        mm = _model_metadata_module()
+        ctx = mm.get_model_context_length(
             "anthropic.claude-opus-4-v1:0",
             provider="bedrock",
             base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -1036,7 +1062,8 @@ class TestBedrockContextResolution:
     @patch("agent.model_metadata.fetch_endpoint_model_metadata")
     def test_bedrock_url_without_provider_hint(self, mock_fetch):
         """bedrock-runtime host infers Bedrock even when provider is omitted."""
-        ctx = get_model_context_length(
+        mm = _model_metadata_module()
+        ctx = mm.get_model_context_length(
             "anthropic.claude-sonnet-4-v1:0",
             base_url="https://bedrock-runtime.us-west-2.amazonaws.com",
         )
@@ -1046,8 +1073,9 @@ class TestBedrockContextResolution:
     @patch("agent.model_metadata.fetch_endpoint_model_metadata")
     def test_non_bedrock_url_still_probes(self, mock_fetch):
         """Non-Bedrock hosts still reach the custom-endpoint probe."""
+        mm = _model_metadata_module()
         mock_fetch.return_value = {"some-model": {"context_length": 50000}}
-        ctx = get_model_context_length(
+        ctx = mm.get_model_context_length(
             "some-model",
             base_url="https://api.example.com/v1",
         )
@@ -1092,7 +1120,7 @@ class TestStripProviderPrefix:
         with patch("agent.model_metadata.fetch_endpoint_model_metadata") as mock_ep, \
              patch("agent.model_metadata._is_custom_endpoint", return_value=True):
             mock_ep.return_value = {"qwen3.5:27b": {"context_length": 32768}}
-            result = get_model_context_length(
+            result = _model_metadata_module().get_model_context_length(
                 "qwen3.5:27b",
                 base_url="http://localhost:11434/v1",
             )
@@ -1124,7 +1152,7 @@ class TestFetchModelMetadata:
         )
 
         with patch("agent.model_metadata.requests.get") as mock_get:
-            result = fetch_model_metadata()
+            result = _model_metadata_module().fetch_model_metadata()
 
         mock_get.assert_not_called()
         assert result["test/model"]["context_length"] == 12345
@@ -1144,7 +1172,7 @@ class TestFetchModelMetadata:
         mock_response.raise_for_status = MagicMock()
 
         with patch("agent.model_metadata.requests.get", return_value=mock_response) as mock_get:
-            result = fetch_model_metadata(force_refresh=True)
+            result = _model_metadata_module().fetch_model_metadata(force_refresh=True)
 
         assert mock_get.call_count == 1
         assert "live/model" in result
@@ -1160,7 +1188,7 @@ class TestFetchModelMetadata:
         mock_response.raise_for_status = MagicMock()
 
         with patch("agent.model_metadata.requests.get", return_value=mock_response):
-            fetch_model_metadata(force_refresh=True)
+            _model_metadata_module().fetch_model_metadata(force_refresh=True)
 
         assert cache_path.exists()
         assert "live/model" in cache_path.read_text(encoding="utf-8")
@@ -1177,7 +1205,7 @@ class TestFetchModelMetadata:
         os.utime(cache_path, (old, old))
 
         with patch("agent.model_metadata.requests.get", side_effect=Exception("Network error")):
-            result = fetch_model_metadata(force_refresh=True)
+            result = _model_metadata_module().fetch_model_metadata(force_refresh=True)
 
         assert result["stale/model"]["context_length"] == 50000
 
@@ -1191,11 +1219,11 @@ class TestFetchModelMetadata:
         mock_response.raise_for_status = MagicMock()
         mock_get.return_value = mock_response
 
-        result1 = fetch_model_metadata(force_refresh=True)
+        result1 = _model_metadata_module().fetch_model_metadata(force_refresh=True)
         assert "test/model" in result1
         assert mock_get.call_count == 1
 
-        result2 = fetch_model_metadata()
+        result2 = _model_metadata_module().fetch_model_metadata()
         assert "test/model" in result2
         assert mock_get.call_count == 1  # cached
 
@@ -1203,7 +1231,7 @@ class TestFetchModelMetadata:
     def test_api_failure_returns_empty_on_cold_cache(self, mock_get):
         self._reset_cache()
         mock_get.side_effect = Exception("Network error")
-        result = fetch_model_metadata(force_refresh=True)
+        result = _model_metadata_module().fetch_model_metadata(force_refresh=True)
         assert result == {}
 
     @patch("agent.model_metadata.requests.get")
@@ -1214,7 +1242,7 @@ class TestFetchModelMetadata:
         mm._model_metadata_cache_time = 0  # expired
 
         mock_get.side_effect = Exception("Network error")
-        result = fetch_model_metadata(force_refresh=True)
+        result = _model_metadata_module().fetch_model_metadata(force_refresh=True)
         assert "old/model" in result
         assert result["old/model"]["context_length"] == 50000
 
@@ -1234,7 +1262,7 @@ class TestFetchModelMetadata:
         mock_response.raise_for_status = MagicMock()
         mock_get.return_value = mock_response
 
-        result = fetch_model_metadata(force_refresh=True)
+        result = _model_metadata_module().fetch_model_metadata(force_refresh=True)
         # Both the original ID and canonical slug should work
         assert "anthropic/claude-3.5-sonnet:beta" in result
         assert "anthropic/claude-3.5-sonnet" in result
@@ -1254,7 +1282,7 @@ class TestFetchModelMetadata:
         mock_response.raise_for_status = MagicMock()
         mock_get.return_value = mock_response
 
-        result = fetch_model_metadata(force_refresh=True)
+        result = _model_metadata_module().fetch_model_metadata(force_refresh=True)
 
         assert result["provider/test-model"]["context_length"] == 123456
         assert result["test-model"]["context_length"] == 123456
@@ -1273,7 +1301,7 @@ class TestFetchModelMetadata:
         mock_response.raise_for_status = MagicMock()
         mock_get.return_value = mock_response
 
-        fetch_model_metadata(force_refresh=True)
+        _model_metadata_module().fetch_model_metadata(force_refresh=True)
         assert mock_get.call_count == 1
 
         # Simulate both memory and disk TTL expiry.
@@ -1281,7 +1309,7 @@ class TestFetchModelMetadata:
         old = time.time() - _MODEL_CACHE_TTL - 1
         import os
         os.utime(cache_path, (old, old))
-        fetch_model_metadata()
+        _model_metadata_module().fetch_model_metadata()
         assert mock_get.call_count == 2  # refetched
 
     @patch("agent.model_metadata.requests.get")
@@ -1293,7 +1321,7 @@ class TestFetchModelMetadata:
         mock_response.raise_for_status = MagicMock()
         mock_get.return_value = mock_response
 
-        result = fetch_model_metadata(force_refresh=True)
+        result = _model_metadata_module().fetch_model_metadata(force_refresh=True)
         assert result == {}
 
 
@@ -1397,35 +1425,35 @@ class TestContextLengthCache:
     def test_save_and_load(self, tmp_path):
         cache_file = tmp_path / "cache.yaml"
         with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
-            save_context_length("test/model", "http://localhost:8080/v1", 32768)
-            assert get_cached_context_length("test/model", "http://localhost:8080/v1") == 32768
+            _model_metadata_module().save_context_length("test/model", "http://localhost:8080/v1", 32768)
+            assert _model_metadata_module().get_cached_context_length("test/model", "http://localhost:8080/v1") == 32768
 
     def test_missing_cache_returns_none(self, tmp_path):
         cache_file = tmp_path / "nonexistent.yaml"
         with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
-            assert get_cached_context_length("test/model", "http://x") is None
+            assert _model_metadata_module().get_cached_context_length("test/model", "http://x") is None
 
     def test_multiple_models_cached(self, tmp_path):
         cache_file = tmp_path / "cache.yaml"
         with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
-            save_context_length("model-a", "http://a", 64000)
-            save_context_length("model-b", "http://b", 128000)
-            assert get_cached_context_length("model-a", "http://a") == 64000
-            assert get_cached_context_length("model-b", "http://b") == 128000
+            _model_metadata_module().save_context_length("model-a", "http://a", 64000)
+            _model_metadata_module().save_context_length("model-b", "http://b", 128000)
+            assert _model_metadata_module().get_cached_context_length("model-a", "http://a") == 64000
+            assert _model_metadata_module().get_cached_context_length("model-b", "http://b") == 128000
 
     def test_same_model_different_providers(self, tmp_path):
         cache_file = tmp_path / "cache.yaml"
         with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
-            save_context_length("llama-3", "http://local:8080", 32768)
-            save_context_length("llama-3", "https://openrouter.ai/api/v1", 131072)
-            assert get_cached_context_length("llama-3", "http://local:8080") == 32768
-            assert get_cached_context_length("llama-3", "https://openrouter.ai/api/v1") == 131072
+            _model_metadata_module().save_context_length("llama-3", "http://local:8080", 32768)
+            _model_metadata_module().save_context_length("llama-3", "https://openrouter.ai/api/v1", 131072)
+            assert _model_metadata_module().get_cached_context_length("llama-3", "http://local:8080") == 32768
+            assert _model_metadata_module().get_cached_context_length("llama-3", "https://openrouter.ai/api/v1") == 131072
 
     def test_idempotent_save(self, tmp_path):
         cache_file = tmp_path / "cache.yaml"
         with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
-            save_context_length("model", "http://x", 32768)
-            save_context_length("model", "http://x", 32768)
+            _model_metadata_module().save_context_length("model", "http://x", 32768)
+            _model_metadata_module().save_context_length("model", "http://x", 32768)
             with open(cache_file) as f:
                 data = yaml.safe_load(f)
             assert len(data["context_lengths"]) == 1
@@ -1434,31 +1462,31 @@ class TestContextLengthCache:
         """Saving a different value for the same key overwrites it."""
         cache_file = tmp_path / "cache.yaml"
         with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
-            save_context_length("model", "http://x", 128000)
-            save_context_length("model", "http://x", 64000)
-            assert get_cached_context_length("model", "http://x") == 64000
+            _model_metadata_module().save_context_length("model", "http://x", 128000)
+            _model_metadata_module().save_context_length("model", "http://x", 64000)
+            assert _model_metadata_module().get_cached_context_length("model", "http://x") == 64000
 
     def test_corrupted_yaml_returns_empty(self, tmp_path):
         """Corrupted cache file is handled gracefully."""
         cache_file = tmp_path / "cache.yaml"
         cache_file.write_text("{{{{not valid yaml: [[[")
         with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
-            assert get_cached_context_length("model", "http://x") is None
+            assert _model_metadata_module().get_cached_context_length("model", "http://x") is None
 
     def test_wrong_structure_returns_none(self, tmp_path):
         """YAML that loads but has wrong structure."""
         cache_file = tmp_path / "cache.yaml"
         cache_file.write_text("just_a_string\n")
         with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
-            assert get_cached_context_length("model", "http://x") is None
+            assert _model_metadata_module().get_cached_context_length("model", "http://x") is None
 
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_cached_value_takes_priority(self, mock_fetch, tmp_path):
         mock_fetch.return_value = {}
         cache_file = tmp_path / "cache.yaml"
         with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
-            save_context_length("unknown/model", "http://local", 65536)
-            assert get_model_context_length("unknown/model", base_url="http://local") == 65536
+            _model_metadata_module().save_context_length("unknown/model", "http://local", 65536)
+            assert _model_metadata_module().get_model_context_length("unknown/model", base_url="http://local") == 65536
 
     def test_special_chars_in_model_name(self, tmp_path):
         """Model names with colons, slashes, etc. don't break the cache."""
@@ -1466,8 +1494,8 @@ class TestContextLengthCache:
         model = "anthropic/claude-3.5-sonnet:beta"
         url = "https://api.example.com/v1"
         with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
-            save_context_length(model, url, 200000)
-            assert get_cached_context_length(model, url) == 200000
+            _model_metadata_module().save_context_length(model, url, 200000)
+            assert _model_metadata_module().get_cached_context_length(model, url) == 200000
 
 
 class TestGrok43StaleCacheGuard:

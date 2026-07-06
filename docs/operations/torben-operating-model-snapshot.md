@@ -77,12 +77,16 @@ Active jobs at snapshot time:
   topics, asks Grok with X Search for concrete reply opportunities, stages
   draft-only local reply ideas, and stays silent when there are no fresh
   opportunities.
-- `torben-finance-radar`: `every 30m`, Signal, no-agent Ratatosk stage-only
-  finance radar. It calls Robinhood v0.1 analysis, lets Ratatosk mint one
-  bounded no-tools LLM run for each due market phase, stages fresh
-  above-threshold `FIN-*` review handles, and stays silent on no due tick,
-  below-threshold output, or duplicate candidates. It does not submit broker
-  orders.
+- `torben-finance-radar`: `35 9,12,15 * * 1-5`, Signal, no-agent Ratatosk
+  stage-only broad opportunity radar. It scans beyond blue-chip names, lets
+  Ratatosk mint bounded no-tools LLM judgment only when evidence warrants it,
+  stages fresh above-threshold `FIN-*` review handles, and stays silent on
+  quiet scans, below-threshold output, or duplicate candidates. It does not
+  submit broker orders.
+- `torben-weekly-behavior-audit`: `0 17 * * 5`, Signal, no-agent redacted
+  cross-surface learning audit. It proposes review-gated skill or runbook
+  candidates only when a pattern is recurring, non-obvious, codifiable, and
+  validation-ready.
 
 ## Auth Cutover
 

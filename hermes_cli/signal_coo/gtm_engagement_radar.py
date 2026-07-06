@@ -21,6 +21,7 @@ import requests
 from tools.xai_http import hermes_xai_user_agent, resolve_xai_http_credentials
 
 from .action_ledger import ActionLedger, ActionRecord
+from .automation_policy import gtm_automation_decision, load_torben_automation_policy
 from .gtm_x_algorithm import x_algorithm_brief_line, x_algorithm_signal_lens
 
 
@@ -28,6 +29,14 @@ DEFAULT_MODEL = "grok-4.3"
 DEFAULT_TIMEOUT_SECONDS = 180
 DEFAULT_MAX_TOPICS = 3
 DEFAULT_MAX_OPPORTUNITIES = 3
+ZERO_PUBLIC_MUTATION_FIELDS = {
+    "posted": 0,
+    "replied": 0,
+    "scheduled": 0,
+    "sent": 0,
+    "public_actions_taken": 0,
+    "external_mutations": 0,
+}
 
 
 @dataclass(frozen=True)
@@ -62,9 +71,10 @@ def run_gtm_engagement_radar(
 
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     state_file = Path(state_path)
+    policy = load_torben_automation_policy()
     topics = select_engagement_topics(radar, max_topics=max_topics)
     if not topics:
-        payload = _silent_payload(now=now, reason="no GTM topics available")
+        payload = _silent_payload(now=now, reason="no GTM topics available", policy=policy)
         payload.update(
             _audit_fields(
                 discovery={},
@@ -74,6 +84,7 @@ def run_gtm_engagement_radar(
                 wake_agent=False,
                 wake_reason="no_gtm_topics_available",
                 llm_invoked=False,
+                policy=policy,
             )
         )
         payload.update({"topic_count": 0, "opportunity_count": 0, "selected_count": 0})
@@ -91,7 +102,7 @@ def run_gtm_engagement_radar(
     fresh = [opp for opp in opportunities if opp.fingerprint not in delivered]
 
     if not fresh:
-        payload = _silent_payload(now=now, reason="no new response opportunities")
+        payload = _silent_payload(now=now, reason="no new response opportunities", policy=policy)
         payload.update(
             {
                 "topic_count": len(topics),
@@ -110,6 +121,7 @@ def run_gtm_engagement_radar(
                 wake_agent=False,
                 wake_reason="no_new_response_opportunities",
                 llm_invoked=True,
+                policy=policy,
             )
         )
         return payload
@@ -125,6 +137,7 @@ def run_gtm_engagement_radar(
         actions=actions,
         topic_count=len(topics),
         now=now,
+        policy_decision=gtm_automation_decision(action="draft_reply", policy=policy),
     )
     payload = {
         "task": "torben_gtm_engagement_radar",
@@ -140,9 +153,15 @@ def run_gtm_engagement_radar(
         "discovery": _safe_discovery_meta(discovery),
         "x_algorithm_signal_lens": x_algorithm_signal_lens(),
         "text": text,
-        "public_actions_taken": 0,
-        "external_mutations": 0,
     }
+    payload.update(
+        _engagement_contract_fields(
+            opportunities=fresh[:max_opportunities],
+            candidate_count=len(opportunities),
+            staged=True,
+            policy=policy,
+        )
+    )
     payload.update(
         _audit_fields(
             discovery=discovery,
@@ -152,6 +171,7 @@ def run_gtm_engagement_radar(
             wake_agent=True,
             wake_reason="llm_judged_reply_opportunities_selected",
             llm_invoked=True,
+            policy=policy,
         )
     )
     if mark_delivered and stage_actions:
@@ -239,6 +259,7 @@ def render_gtm_engagement_text(
     actions: list[ActionRecord],
     topic_count: int,
     now: datetime,
+    policy_decision: dict[str, Any] | None = None,
 ) -> str:
     lines = [
         f"Torben / GTM Response Radar / {now:%Y-%m-%d %H:%M UTC}",
@@ -247,6 +268,7 @@ def render_gtm_engagement_text(
         "LLM judge: Grok ran with x_search; all public writes remain approval-gated.",
         x_algorithm_brief_line(),
         "Nothing has been posted, replied to publicly, scheduled, or sent.",
+        _automation_line(policy_decision),
         "",
     ]
     for idx, (opp, action) in enumerate(zip(opportunities, actions), start=1):
@@ -521,15 +543,48 @@ def _normalize_risk_notes(value: Any) -> list[str]:
     return notes[:3]
 
 
-def _silent_payload(*, now: datetime, reason: str) -> dict[str, Any]:
-    return {
+def _silent_payload(*, now: datetime, reason: str, policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = {
         "task": "torben_gtm_engagement_radar",
         "wakeAgent": False,
         "generated_at": _iso(now),
         "reason": reason,
         "text": "",
-        "public_actions_taken": 0,
-        "external_mutations": 0,
+    }
+    payload.update(_engagement_contract_fields(opportunities=[], candidate_count=0, staged=False, policy=policy))
+    return payload
+
+
+def _engagement_contract_fields(
+    *,
+    opportunities: list[GTMResponseOpportunity],
+    candidate_count: int,
+    staged: bool,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    first = opportunities[0] if opportunities else None
+    source_refs: list[str] = []
+    for opp in opportunities:
+        for value in (opp.post_url, opp.source_url):
+            text = str(value or "").strip()
+            if text and text not in source_refs:
+                source_refs.append(text)
+    policy_decision = gtm_automation_decision(action="draft_reply" if staged else "hold", policy=policy)
+    return {
+        **ZERO_PUBLIC_MUTATION_FIELDS,
+        "status": "staged" if staged else "silent",
+        "approval_status": "approval_required" if staged else "not_required_no_action",
+        "source_refs": source_refs,
+        "thesis": (first.reply_angle or first.why_reply or first.post_summary) if first else None,
+        "suggested_action": "draft_reply" if staged else "hold",
+        "candidate_count": int(candidate_count),
+        "automation_policy": policy_decision,
+        "auto_invoke_allowed": bool(policy_decision.get("auto_invoke_allowed")),
+        "recommendation_status": (
+            "auto_surface_allowed"
+            if policy_decision.get("recommendation_allowed")
+            else "auto_surface_blocked"
+        ),
     }
 
 
@@ -542,11 +597,13 @@ def _audit_fields(
     wake_agent: bool,
     wake_reason: str,
     llm_invoked: bool,
+    policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     meta = _safe_discovery_meta(discovery)
     model = str(meta.get("model") or os.getenv("TORBEN_GTM_ENGAGEMENT_MODEL") or DEFAULT_MODEL).strip()
     x_search_used = bool(meta.get("x_search_used")) if llm_invoked else False
     status = "accepted" if selected_count > 0 else ("no_new_opportunities" if llm_invoked else "not_invoked")
+    policy_decision = gtm_automation_decision(action="draft_reply" if wake_agent else "hold", policy=policy)
     return {
         "llm_judge": {
             "enabled": True,
@@ -572,6 +629,7 @@ def _audit_fields(
             "wake_reason": wake_reason,
             "public_actions_taken": 0,
             "external_mutations": 0,
+            "automation_policy": policy_decision,
         },
     }
 
@@ -704,6 +762,14 @@ def _positive_int(value: Any, default: int) -> int:
         return parsed if parsed > 0 else default
     except (TypeError, ValueError):
         return default
+
+
+def _automation_line(policy_decision: dict[str, Any] | None) -> str:
+    if not policy_decision:
+        return "Automation policy: reply recommendations may auto-surface; public replies remain approval-gated."
+    if policy_decision.get("decision") == "allowed":
+        return "Automation policy: reply recommendations may auto-surface; public replies still require explicit approval."
+    return "Automation policy: reply recommendation surfacing is blocked by policy; no public reply is allowed."
 
 
 def _iso(value: datetime) -> str:

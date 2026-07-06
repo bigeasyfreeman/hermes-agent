@@ -37,6 +37,12 @@ from agent.prompt_builder import (
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
 
 
+def _prompt_builder_module():
+    import agent.prompt_builder as prompt_builder
+
+    return prompt_builder
+
+
 # =========================================================================
 # Guidance constants
 # =========================================================================
@@ -300,7 +306,7 @@ class TestParseSkillFile:
         skill_file.write_text(
             "---\nname: test-skill\ndescription: A useful test skill\n---\n\nBody here"
         )
-        is_compat, frontmatter, desc = _parse_skill_file(skill_file)
+        is_compat, frontmatter, desc = _prompt_builder_module()._parse_skill_file(skill_file)
         assert is_compat is True
         assert frontmatter.get("name") == "test-skill"
         assert desc == "A useful test skill"
@@ -308,19 +314,19 @@ class TestParseSkillFile:
     def test_missing_description_returns_empty(self, tmp_path):
         skill_file = tmp_path / "SKILL.md"
         skill_file.write_text("No frontmatter here")
-        is_compat, frontmatter, desc = _parse_skill_file(skill_file)
+        is_compat, frontmatter, desc = _prompt_builder_module()._parse_skill_file(skill_file)
         assert desc == ""
 
     def test_long_description_truncated(self, tmp_path):
         skill_file = tmp_path / "SKILL.md"
         long_desc = "A" * 100
         skill_file.write_text(f"---\ndescription: {long_desc}\n---\n")
-        _, _, desc = _parse_skill_file(skill_file)
+        _, _, desc = _prompt_builder_module()._parse_skill_file(skill_file)
         assert len(desc) <= 60
         assert desc.endswith("...")
 
     def test_nonexistent_file_returns_defaults(self, tmp_path):
-        is_compat, frontmatter, desc = _parse_skill_file(tmp_path / "missing.md")
+        is_compat, frontmatter, desc = _prompt_builder_module()._parse_skill_file(tmp_path / "missing.md")
         assert is_compat is True
         assert frontmatter == {}
         assert desc == ""
@@ -334,7 +340,7 @@ class TestParseSkillFile:
 
         monkeypatch.setattr(type(skill_file), "read_text", boom)
         with caplog.at_level(logging.DEBUG, logger="agent.prompt_builder"):
-            is_compat, frontmatter, desc = _parse_skill_file(skill_file)
+            is_compat, frontmatter, desc = _prompt_builder_module()._parse_skill_file(skill_file)
 
         assert is_compat is True
         assert frontmatter == {}
@@ -351,7 +357,7 @@ class TestParseSkillFile:
 
         with patch("agent.skill_utils.sys") as mock_sys:
             mock_sys.platform = "linux"
-            is_compat, _, _ = _parse_skill_file(skill_file)
+            is_compat, _, _ = _prompt_builder_module()._parse_skill_file(skill_file)
         assert is_compat is False
 
     def test_returns_frontmatter_with_prerequisites(self, tmp_path, monkeypatch):
@@ -361,7 +367,7 @@ class TestParseSkillFile:
             "---\nname: gated\ndescription: Gated skill\n"
             "prerequisites:\n  env_vars: [NONEXISTENT_KEY_ABC]\n---\n"
         )
-        _, frontmatter, _ = _parse_skill_file(skill_file)
+        _, frontmatter, _ = _prompt_builder_module()._parse_skill_file(skill_file)
         assert frontmatter["prerequisites"]["env_vars"] == ["NONEXISTENT_KEY_ABC"]
 
 
@@ -400,7 +406,7 @@ class TestBuildSkillsSystemPrompt:
 
     def test_empty_when_no_skills_dir(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        result = build_skills_system_prompt()
+        result = _prompt_builder_module().build_skills_system_prompt()
         assert result == ""
 
     def test_builds_index_with_skills(self, monkeypatch, tmp_path):
@@ -410,7 +416,7 @@ class TestBuildSkillsSystemPrompt:
         (skills_dir / "SKILL.md").write_text(
             "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
         )
-        result = build_skills_system_prompt()
+        result = _prompt_builder_module().build_skills_system_prompt()
         assert "python-debug" in result
         assert "Debug Python scripts" in result
         assert "available_skills" in result
@@ -422,7 +428,7 @@ class TestBuildSkillsSystemPrompt:
             d = cat_dir / subdir
             d.mkdir(parents=True, exist_ok=True)
             (d / "SKILL.md").write_text("---\ndescription: Search stuff\n---\n")
-        result = build_skills_system_prompt()
+        result = _prompt_builder_module().build_skills_system_prompt()
         # "search" should appear only once per category
         assert result.count("- search") == 1
 
@@ -442,7 +448,7 @@ class TestBuildSkillsSystemPrompt:
                 f"---\nname: {name}\ndescription: Does {name} things\n---\n"
             )
 
-        result = build_skills_system_prompt(
+        result = _prompt_builder_module().build_skills_system_prompt(
             compact_categories=frozenset({"social-media"})
         )
         # Coding-adjacent category keeps its full entry.
@@ -465,13 +471,13 @@ class TestBuildSkillsSystemPrompt:
         )
         # Nested category ("social-media/twitter") demoted via its parent:
         # name visible, description gone.
-        compact = build_skills_system_prompt(
+        compact = _prompt_builder_module().build_skills_system_prompt(
             compact_categories=frozenset({"social-media"})
         )
         assert "thread-writer" in compact
         assert "Write threads" not in compact
         # Unfiltered call must not be served from the compacted cache entry.
-        full = build_skills_system_prompt()
+        full = _prompt_builder_module().build_skills_system_prompt()
         assert "Write threads" in full
 
     def test_excludes_incompatible_platform_skills(self, monkeypatch, tmp_path):
@@ -498,7 +504,7 @@ class TestBuildSkillsSystemPrompt:
 
         with patch("agent.skill_utils.sys") as mock_sys:
             mock_sys.platform = "linux"
-            result = build_skills_system_prompt()
+            result = _prompt_builder_module().build_skills_system_prompt()
 
         assert "web-search" in result
         assert "imessage" not in result
@@ -517,7 +523,7 @@ class TestBuildSkillsSystemPrompt:
 
         with patch("agent.skill_utils.sys") as mock_sys:
             mock_sys.platform = "darwin"
-            result = build_skills_system_prompt()
+            result = _prompt_builder_module().build_skills_system_prompt()
 
         assert "imessage" in result
         assert "Send iMessages" in result
@@ -542,11 +548,12 @@ class TestBuildSkillsSystemPrompt:
 
         from unittest.mock import patch
 
-        with patch(
-            "agent.prompt_builder.get_disabled_skill_names",
+        with patch.object(
+            _prompt_builder_module(),
+            "get_disabled_skill_names",
             return_value={"old-tool"},
         ):
-            result = build_skills_system_prompt()
+            result = _prompt_builder_module().build_skills_system_prompt()
 
         assert "web-search" in result
         assert "old-tool" not in result
@@ -559,14 +566,14 @@ class TestBuildSkillsSystemPrompt:
             "---\nname: cached-skill\ndescription: Cached skill\n---\n"
         )
 
-        first = build_skills_system_prompt()
+        first = _prompt_builder_module().build_skills_system_prompt()
         assert "cached-skill" in first
 
         (tmp_path / "config.yaml").write_text(
             "skills:\n  disabled: [cached-skill]\n"
         )
 
-        second = build_skills_system_prompt()
+        second = _prompt_builder_module().build_skills_system_prompt()
         assert "cached-skill" not in second
 
     def test_includes_setup_needed_skills(self, monkeypatch, tmp_path):
@@ -587,7 +594,7 @@ class TestBuildSkillsSystemPrompt:
             "---\nname: free-skill\ndescription: No prereqs\n---\n"
         )
 
-        result = build_skills_system_prompt()
+        result = _prompt_builder_module().build_skills_system_prompt()
         assert "free-skill" in result
         assert "gated-skill" in result
 
@@ -604,7 +611,7 @@ class TestBuildSkillsSystemPrompt:
             "prerequisites:\n  env_vars: [MY_API_KEY]\n---\n"
         )
 
-        result = build_skills_system_prompt()
+        result = _prompt_builder_module().build_skills_system_prompt()
         assert "ready-skill" in result
 
     def test_non_local_backend_keeps_skill_visible_without_probe(
@@ -622,7 +629,7 @@ class TestBuildSkillsSystemPrompt:
             "prerequisites:\n  env_vars: [BACKEND_ONLY_KEY]\n---\n"
         )
 
-        result = build_skills_system_prompt()
+        result = _prompt_builder_module().build_skills_system_prompt()
         assert "backend-skill" in result
 
 
@@ -1339,7 +1346,7 @@ class TestBuildSkillsSystemPromptConditional:
         (skill_dir / "SKILL.md").write_text(
             "---\nname: duckduckgo\ndescription: Free web search\nmetadata:\n  hermes:\n    fallback_for_toolsets: [web]\n---\n"
         )
-        result = build_skills_system_prompt(
+        result = _prompt_builder_module().build_skills_system_prompt(
             available_tools=set(),
             available_toolsets={"web"},
         )
@@ -1352,7 +1359,7 @@ class TestBuildSkillsSystemPromptConditional:
         (skill_dir / "SKILL.md").write_text(
             "---\nname: duckduckgo\ndescription: Free web search\nmetadata:\n  hermes:\n    fallback_for_toolsets: [web]\n---\n"
         )
-        result = build_skills_system_prompt(
+        result = _prompt_builder_module().build_skills_system_prompt(
             available_tools=set(),
             available_toolsets=set(),
         )
@@ -1365,7 +1372,7 @@ class TestBuildSkillsSystemPromptConditional:
         (skill_dir / "SKILL.md").write_text(
             "---\nname: openhue\ndescription: Hue lights\nmetadata:\n  hermes:\n    requires_toolsets: [terminal]\n---\n"
         )
-        result = build_skills_system_prompt(
+        result = _prompt_builder_module().build_skills_system_prompt(
             available_tools=set(),
             available_toolsets=set(),
         )
@@ -1378,7 +1385,7 @@ class TestBuildSkillsSystemPromptConditional:
         (skill_dir / "SKILL.md").write_text(
             "---\nname: openhue\ndescription: Hue lights\nmetadata:\n  hermes:\n    requires_toolsets: [terminal]\n---\n"
         )
-        result = build_skills_system_prompt(
+        result = _prompt_builder_module().build_skills_system_prompt(
             available_tools=set(),
             available_toolsets={"terminal"},
         )
@@ -1391,7 +1398,7 @@ class TestBuildSkillsSystemPromptConditional:
         (skill_dir / "SKILL.md").write_text(
             "---\nname: notes\ndescription: Take notes\n---\n"
         )
-        result = build_skills_system_prompt(
+        result = _prompt_builder_module().build_skills_system_prompt(
             available_tools=set(),
             available_toolsets=set(),
         )
@@ -1405,7 +1412,7 @@ class TestBuildSkillsSystemPromptConditional:
         (skill_dir / "SKILL.md").write_text(
             "---\nname: duckduckgo\ndescription: Free web search\nmetadata:\n  hermes:\n    fallback_for_toolsets: [web]\n---\n"
         )
-        result = build_skills_system_prompt()
+        result = _prompt_builder_module().build_skills_system_prompt()
         assert "duckduckgo" in result
 
     def test_null_metadata_does_not_crash(self, monkeypatch, tmp_path):
@@ -1417,7 +1424,7 @@ class TestBuildSkillsSystemPromptConditional:
         (skill_dir / "SKILL.md").write_text(
             "---\nname: safe-skill\ndescription: Survives null metadata\nmetadata:\n---\n"
         )
-        result = build_skills_system_prompt(
+        result = _prompt_builder_module().build_skills_system_prompt(
             available_tools=set(),
             available_toolsets=set(),
         )
@@ -1431,7 +1438,7 @@ class TestBuildSkillsSystemPromptConditional:
         (skill_dir / "SKILL.md").write_text(
             "---\nname: nested-null\ndescription: Null hermes key\nmetadata:\n  hermes:\n---\n"
         )
-        result = build_skills_system_prompt(
+        result = _prompt_builder_module().build_skills_system_prompt(
             available_tools=set(),
             available_toolsets=set(),
         )
@@ -1554,5 +1561,3 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
-

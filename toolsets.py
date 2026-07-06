@@ -26,6 +26,15 @@ Usage:
 from typing import List, Dict, Any, Set, Optional
 
 
+_LOOPY_TOOLS = [
+    "loopy_catalog_search",
+    "loopy_validate_loop",
+    "loopy_draft_loop",
+    "loopy_memory_task_review",
+    "loopy_memory_weekly_review",
+]
+
+
 # Shared tool list for CLI and all messaging platform toolsets.
 # Edit this once to update all platforms simultaneously.
 _HERMES_CORE_TOOLS = [
@@ -64,6 +73,8 @@ _HERMES_CORE_TOOLS = [
     "execute_code", "delegate_task",
     # Cronjob management
     "cronjob",
+    # Loop design and Loop Library discovery
+    *_LOOPY_TOOLS,
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
     # Kanban multi-agent coordination — only in schema when the agent is
@@ -183,6 +194,15 @@ TOOLSETS = {
         "description": "Cronjob management tool - create, list, update, pause, resume, remove, and trigger scheduled tasks",
         "tools": ["cronjob"],
         "includes": []
+    },
+
+    "loopy": {
+        "description": (
+            "Loop Library and Loopy tools for finding published loops, validating loop designs, "
+            "and drafting Hermes-ready loop prompts or blueprint SKILL.md files."
+        ),
+        "tools": _LOOPY_TOOLS,
+        "includes": [],
     },
     
 
@@ -356,6 +376,7 @@ TOOLSETS = {
             "todo", "memory",
             "session_search", "clarify",
             "execute_code", "delegate_task",
+            *_LOOPY_TOOLS,
         ],
         "includes": [],
         # Posture toolset: selected per-session by agent/coding_context.py,
@@ -388,6 +409,7 @@ TOOLSETS = {
             "todo", "memory",
             "session_search",
             "execute_code", "delegate_task",
+            *_LOOPY_TOOLS,
         ],
         "includes": []
     },
@@ -418,6 +440,8 @@ TOOLSETS = {
             "execute_code", "delegate_task",
             # Cronjob management
             "cronjob",
+            # Loop design and Loop Library discovery
+            *_LOOPY_TOOLS,
             # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
             "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
 

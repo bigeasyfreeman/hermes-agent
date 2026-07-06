@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import re
+import socket
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -16,6 +19,17 @@ from .morning_brief import build_morning_brief_scope
 
 GMAIL_API_ROOT = "https://gmail.googleapis.com/gmail/v1/users/me"
 CALENDAR_API_ROOT = "https://www.googleapis.com/calendar/v3"
+GOOGLE_EVIDENCE_RETRY_ATTEMPTS = 3
+GOOGLE_EVIDENCE_RETRY_BACKOFF_SECONDS = 0.25
+_TRANSIENT_GOOGLE_ERROR_TEXT = (
+    "timed out",
+    "temporary failure",
+    "name or service not known",
+    "nodename nor servname",
+    "network is unreachable",
+    "connection reset",
+    "connection aborted",
+)
 
 
 @dataclass
@@ -69,10 +83,39 @@ def _read_token(account: GoogleAccount) -> str:
     return token
 
 
-def _google_get(url: str, token: str) -> dict[str, Any]:
-    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"}, method="GET")
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.loads(response.read().decode("utf-8"))
+def _is_transient_google_error(exc: BaseException) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    if isinstance(exc, (TimeoutError, socket.timeout, socket.gaierror)):
+        return True
+    if not isinstance(exc, urllib.error.URLError):
+        return False
+    reason = exc.reason
+    if isinstance(reason, (TimeoutError, socket.timeout, socket.gaierror)):
+        return True
+    return any(token in str(reason).lower() for token in _TRANSIENT_GOOGLE_ERROR_TEXT)
+
+
+def _google_get(
+    url: str,
+    token: str,
+    *,
+    attempts: int = GOOGLE_EVIDENCE_RETRY_ATTEMPTS,
+    backoff_seconds: float = GOOGLE_EVIDENCE_RETRY_BACKOFF_SECONDS,
+    sleep: Any = time.sleep,
+) -> dict[str, Any]:
+    bounded_attempts = max(1, int(attempts))
+    for attempt in range(1, bounded_attempts + 1):
+        request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"}, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            if attempt >= bounded_attempts or not _is_transient_google_error(exc):
+                raise
+            if backoff_seconds > 0:
+                sleep(backoff_seconds * (2 ** (attempt - 1)))
+    raise RuntimeError("unreachable Google evidence retry state")
 
 
 def _calendar_sources(
@@ -401,7 +444,7 @@ def collect_google_ea_evidence(
                 "create private Busy blocks for enabled accounts that do not already have an overlapping event."
             ),
             "mutation_boundary": (
-                "Only synthetic private Busy blocks are created; source events are never edited or deleted."
+                "Only synthetic private Busy blocks are created or removed; source events are never edited or deleted."
             ),
         },
     }

@@ -227,6 +227,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
             sanitized[key] = value
 
+    _ensure_sane_subprocess_path(sanitized)
     _inject_context_hermes_home(sanitized)
 
     from hermes_constants import apply_subprocess_home_env
@@ -444,6 +445,20 @@ def _path_env_key(run_env: dict) -> str | None:
     return None
 
 
+def _ensure_sane_subprocess_path(run_env: dict) -> None:
+    """Ensure sanitized subprocesses can find common user-installed tools.
+
+    Cron scripts and other background subprocesses use the sanitizer directly
+    rather than LocalEnvironment's full terminal env builder. Without this,
+    launchd/systemd minimal PATHs lose Homebrew/local tools like uv.
+    """
+    path_key = _path_env_key(run_env)
+    if path_key is None:
+        return
+    new_path = _append_missing_sane_path_entries(run_env.get(path_key, ""))
+    run_env[path_key] = _prepend_hermes_bin_dir(new_path)
+
+
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
     try:
@@ -459,13 +474,7 @@ def _make_run_env(env: dict) -> dict:
             run_env[real_key] = v
         elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k):
             run_env[k] = v
-    path_key = _path_env_key(run_env)
-    if path_key is not None:
-        new_path = _append_missing_sane_path_entries(run_env.get(path_key, ""))
-        # Ensure the hermes install dir is reachable so plugins can shell out
-        # to bare ``hermes`` via the terminal tool even when the gateway was
-        # launched without it on PATH (systemd, service managers, cron, etc.).
-        run_env[path_key] = _prepend_hermes_bin_dir(new_path)
+    _ensure_sane_subprocess_path(run_env)
 
     _inject_context_hermes_home(run_env)
 

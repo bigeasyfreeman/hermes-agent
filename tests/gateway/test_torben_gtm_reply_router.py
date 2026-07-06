@@ -11,6 +11,89 @@ from hermes_cli.signal_coo import ActionLedger
 from hermes_cli.signal_coo.gtm_radar_adapter import build_torben_gtm_radar_adapter
 
 
+def test_gateway_text_preview_accepts_dict_text():
+    from gateway.run import _coerce_gateway_text_preview, _platform_response_for_shortcut_result
+
+    assert _coerce_gateway_text_preview({"text": "approve GTM-20260626-007"}) == "approve GTM-20260626-007"
+    assert _coerce_gateway_text_preview({"body": "draft 1"}) == "draft 1"
+    assert _coerce_gateway_text_preview({"final_response": {"text": "handled"}}) == "handled"
+    assert _coerce_gateway_text_preview({"blocks": [{"text": "draft 1"}]}).startswith("{")
+    assert _platform_response_for_shortcut_result({"final_response": "sent"}) == "sent"
+    assert _platform_response_for_shortcut_result({"final_response": "sent", "already_delivered": True}) == ""
+
+
+@pytest.mark.asyncio
+async def test_signal_gtm_public_reply_shortcut_sends_ack_without_package_router(monkeypatch, tmp_path):
+    from gateway import run as gateway_run
+    from gateway.run import GatewayRunner
+    import hermes_cli.signal_coo as signal_coo
+
+    profile_home = tmp_path / "torben"
+    ledger = ActionLedger(profile_home / "state" / "torben-action-ledger.json")
+    ledger.save([])
+    monkeypatch.setattr(gateway_run, "_hermes_home", profile_home)
+
+    def fake_public_reply(**kwargs):
+        assert kwargs["reply_text"] == "approve GTM-20260626-007"
+        assert kwargs["dry_run"] is False
+        assert kwargs["yes"] is True
+        return SimpleNamespace(
+            handled=True,
+            text="Torben / GTM Public Reply\n\n- [GTM-20260626-007] Sent public X reply: https://x.com/eric/status/999\n",
+            to_dict=lambda: {
+                "handled": True,
+                "status": "sent",
+                "public_actions_taken": 1,
+                "external_mutations": 1,
+            },
+        )
+
+    monkeypatch.setattr(signal_coo, "send_approved_gtm_public_replies", fake_public_reply)
+    monkeypatch.setattr(
+        signal_coo,
+        "route_gtm_radar_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("draft-package router should not be called")),
+    )
+
+    runner = object.__new__(GatewayRunner)
+    adapter = SimpleNamespace(send=AsyncMock())
+    runner.adapters = {Platform.SIGNAL: adapter}
+    runner.session_store = MagicMock()
+    session_entry = SimpleNamespace(session_id="session-1", session_key="signal:user")
+    source = SessionSource(
+        platform=Platform.SIGNAL,
+        chat_id="+15105553337",
+        user_id="+15105553337",
+        user_name="Eric Freeman",
+        chat_type="dm",
+    )
+    event = MessageEvent(
+        text={"text": "approve GTM-20260626-007"},
+        source=source,
+        message_id="signal-message-1",
+    )
+
+    result = await runner._maybe_handle_torben_gtm_reply(
+        event=event,
+        source=source,
+        session_entry=session_entry,
+        history=[],
+        persist_user_message="approve GTM-20260626-007",
+        persist_user_timestamp=datetime(2026, 6, 26, 12, 0, tzinfo=timezone.utc).timestamp(),
+    )
+
+    assert result is not None
+    assert result["api_calls"] == 0
+    assert result["already_delivered"] is True
+    assert result["torben_gtm_public_reply"]["status"] == "sent"
+    assert result["torben_gtm_public_reply"]["public_actions_taken"] == 1
+    assert "Sent public X reply" in result["final_response"]
+    adapter.send.assert_awaited_once()
+    sent_text = adapter.send.await_args.args[1]
+    assert "GTM-20260626-007" in sent_text
+    assert runner.session_store.append_to_transcript.call_count == 3
+
+
 @pytest.mark.asyncio
 async def test_signal_gtm_reply_router_sends_ack_and_persists(monkeypatch, tmp_path):
     from gateway import run as gateway_run
@@ -70,6 +153,7 @@ async def test_signal_gtm_reply_router_sends_ack_and_persists(monkeypatch, tmp_p
 
     assert result is not None
     assert result["api_calls"] == 0
+    assert result["already_delivered"] is True
     assert result["torben_gtm_reply_router"]["status"] == "content_package_staged"
     adapter.send.assert_awaited_once()
     sent_text = adapter.send.await_args.args[1]
